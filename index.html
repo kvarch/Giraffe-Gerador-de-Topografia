@@ -326,19 +326,27 @@ const CURVAS_TEMP_ID='kv-curvas-3d';
 const CURVAS_PERM_NAME='Curvas de Nível · GeoSampa';
 
 // ══════════════════════════════════════════════════════════════
-//  Separação Geométrica por Uso do Solo
-//  ⚠ Verifique os nomes das camadas no GetCapabilities do WFS
-//    antes de publicar — substitua se necessário.
 // ══════════════════════════════════════════════════════════════
+//  Separação por Uso do Solo — nova abordagem: re-triangulação
+//
+//  Em vez de clipar triângulos existentes (que produz polígonos
+//  de formato arbitrário e Z difícil de preservar), a estratégia
+//  correta é:
+//    1. Encontrar onde as curvas de nível cruzam as fronteiras de
+//       quadra/calçada → pontos com elevação exata (da curva)
+//    2. Interpolar Z dos vértices das fronteiras via TIN existente
+//    3. Re-triangular tudo junto (Delaunay)
+//    4. Classificar cada triângulo resultante por centróide
+//  Resultado: triângulos puros, alturas sempre corretas, limites
+//  naturalmente alinhados com as fronteiras das camadas.
+// ══════════════════════════════════════════════════════════════
+
 const QUADRA_LAYER  = 'geoportal:quadra_viaria_editada'; // confirmado via GetCapabilities
 const CALCADA_LAYER = 'geoportal:calcada';               // confirmado via GetCapabilities
-
 const SPLIT_IDS    = {Quadra:'kv-split-quadra', Calçada:'kv-split-calcada', Rua:'kv-split-rua'};
 const SPLIT_COLORS = {Quadra:'#c87137', Calçada:'#7a8fa6', Rua:'#3a3a3a'};
 
-// ── Interpolação baricêntrica de Z em triângulo 3D ──────────────
-// Dado um ponto 2D [px,py] dentro do triângulo A-B-C (com Z),
-// retorna a altitude interpolada naquele ponto.
+// Interpolação baricêntrica de Z em triângulo 3D A-B-C para ponto 2D [px,py]
 function interpZ(A,B,C,px,py){
   const[ax,ay,az=0]=A,[bx,by,bz=0]=B,[cx,cy,cz=0]=C;
   const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
@@ -348,151 +356,86 @@ function interpZ(A,B,C,px,py){
   return Math.max(0,w1*az+w2*bz+(1-w1-w2)*cz);
 }
 
-// ── Re-injeta Z em feature 2D usando triângulo pai como referência ─
-function injectZ(origTri,feat2D){
-  if(!feat2D?.geometry) return null;
-  const ring=origTri.geometry.coordinates[0]; // [[lng,lat,z],...]
-  const[A,B,C]=ring;
-  const addZ=r=>r.map(([px,py])=>[px,py,interpZ(A,B,C,px,py)]);
-  let geom3D;
-  if(feat2D.geometry.type==='Polygon')
-    geom3D={type:'Polygon',coordinates:feat2D.geometry.coordinates.map(addZ)};
-  else if(feat2D.geometry.type==='MultiPolygon')
-    geom3D={type:'MultiPolygon',coordinates:feat2D.geometry.coordinates.map(p=>p.map(addZ))};
-  else return null;
-  // avgH = média dos Z do anel exterior (para fill-extrusion-height)
-  const outer=geom3D.type==='Polygon'?geom3D.coordinates[0]:geom3D.coordinates[0][0];
-  const avgH=outer.reduce((s,v)=>s+v[2],0)/outer.length;
-  return{...feat2D,geometry:geom3D,properties:{...feat2D.properties,avgH}};
-}
-
-// ── Remove Z de uma feature para operações turf 2D ──────────────
-function strip3D(feat){
-  if(!feat?.geometry) return feat;
-  const strip=r=>r.map(([x,y])=>[x,y]);
-  const g=feat.geometry;
-  let coords;
-  if(g.type==='Polygon')      coords=g.coordinates.map(strip);
-  else if(g.type==='MultiPolygon') coords=g.coordinates.map(p=>p.map(strip));
-  else return feat;
-  return{...feat,geometry:{...g,coordinates:coords}};
-}
-
-// ── Achata Polygon/MultiPolygon → array de Polygon features ─────
-function flattenToPolygons(feat){
-  if(!feat?.geometry) return[];
-  if(feat.geometry.type==='Polygon') return[feat];
-  if(feat.geometry.type==='MultiPolygon')
-    return feat.geometry.coordinates.map(coords=>({
-      ...feat,geometry:{type:'Polygon',coordinates:coords}
-    }));
-  return[];
-}
-
-// ── União de um array de features em um único polígono ───────────
-// Itera par a par; ignora geometrias inválidas silenciosamente.
-function unionMany(features){
-  const polys=features.filter(f=>
-    f?.geometry&&['Polygon','MultiPolygon'].includes(f.geometry.type)
-  );
-  if(!polys.length) return null;
-  let result=polys[0];
-  for(let i=1;i<polys.length;i++){
-    try{result=turf.union(result,polys[i]);}catch(_){}
+// Interpola Z relativo em ponto [lng,lat] varrendoo TIN já construído.
+// Os triângulos do TIN têm coordenadas [lng,lat,z_relativo].
+// Retorna z_relativo ou null se o ponto estiver fora do TIN.
+function interpZFromTIN(lng,lat,tinFeatures){
+  for(const tri of tinFeatures){
+    const ring=tri.geometry.coordinates[0];
+    const[A,B,C]=ring;
+    const[ax,ay,az=0]=A,[bx,by,bz=0]=B,[cx,cy,cz=0]=C;
+    const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
+    if(Math.abs(det)<1e-14) continue;
+    const w1=((by-cy)*(lng-cx)+(cx-bx)*(lat-cy))/det;
+    const w2=((cy-ay)*(lng-cx)+(ax-cx)*(lat-cy))/det;
+    const w3=1-w1-w2;
+    if(w1>=-1e-3&&w2>=-1e-3&&w3>=-1e-3)
+      return Math.max(0,w1*az+w2*bz+w3*cz);
   }
-  return result;
+  return null;
 }
 
-// ── Recorte geométrico do TIN em três categorias ─────────────────
-// Para cada triângulo:
-//   1. Intersecta com quadraUnion → fatia "Quadra"
-//   2. Intersecta o restante com calcadaUnion → fatia "Calçada"
-//   3. O que sobrou → fatia "Rua"
-// Cada fatia recebe Z interpolado via coordenadas baricêntricas do
-// triângulo original — relevo preservado sem distorção.
-function splitTINByLandUse(tinResult,quadraUnion,calcadaUnion){
-  const qBbox=quadraUnion?turf.bbox(quadraUnion):null;
-  const cBbox=calcadaUnion?turf.bbox(calcadaUnion):null;
+// Interseção de dois segmentos de linha com pré-filtro bbox (rápido).
+// Retorna ponto [x,y] ou null se não há interseção no intervalo [0,1].
+function segIntersect(p1,p2,p3,p4){
+  // Bbox check
+  if(Math.max(p1[0],p2[0])<Math.min(p3[0],p4[0])||
+     Math.min(p1[0],p2[0])>Math.max(p3[0],p4[0])||
+     Math.max(p1[1],p2[1])<Math.min(p3[1],p4[1])||
+     Math.min(p1[1],p2[1])>Math.max(p3[1],p4[1])) return null;
+  const dx1=p2[0]-p1[0],dy1=p2[1]-p1[1];
+  const dx2=p4[0]-p3[0],dy2=p4[1]-p3[1];
+  const cross=dx1*dy2-dy1*dx2;
+  if(Math.abs(cross)<1e-14) return null;
+  const t=((p3[0]-p1[0])*dy2-(p3[1]-p1[1])*dx2)/cross;
+  const u=((p3[0]-p1[0])*dy1-(p3[1]-p1[1])*dx1)/cross;
+  if(t>=0&&t<=1&&u>=0&&u<=1) return[p1[0]+t*dx1,p1[1]+t*dy1];
+  return null;
+}
 
-  function bboxOverlaps([ax,ay,bx,by],[cx,cy,dx,dy]){
-    return ax<=dx&&bx>=cx&&ay<=dy&&by>=cy;
-  }
-
-  const qFeats=[],cFeats=[],rFeats=[];
-
-  for(const tri of tinResult.features){
-    const tri2D=strip3D(tri);
-    const tBbox=turf.bbox(tri2D);
-    const props=tri.properties;
-
-    // ── Fatia Quadra ──────────────────────────────────────────
-    let afterQ=tri2D;  // resto a processar após extrair quadra
-    if(quadraUnion&&qBbox&&bboxOverlaps(tBbox,qBbox)){
-      try{
-        const qPart=turf.intersect(tri2D,quadraUnion);
-        if(qPart?.geometry){
-          const q3D=injectZ(tri,{...qPart,properties:{...props,usage:'Quadra'}});
-          if(q3D) flattenToPolygons(q3D).flatMap(retriangulate).forEach(f=>qFeats.push(f));
-        }
-        const diff=turf.difference(tri2D,quadraUnion);
-        afterQ=(diff?.geometry)?diff:null;
-      }catch(_){ /* mantém afterQ=tri2D */ }
-    }
-
-    // ── Fatia Calçada (sobre o que sobrou de quadra) ──────────
-    let afterC=afterQ;
-    if(afterQ&&calcadaUnion&&cBbox){
-      const aBbox=turf.bbox(afterQ);
-      if(bboxOverlaps(aBbox,cBbox)){
-        try{
-          const cPart=turf.intersect(afterQ,calcadaUnion);
-          if(cPart?.geometry){
-            const c3D=injectZ(tri,{...cPart,properties:{...props,usage:'Calçada'}});
-            if(c3D) flattenToPolygons(c3D).flatMap(retriangulate).forEach(f=>cFeats.push(f));
-          }
-          const diff=turf.difference(afterQ,calcadaUnion);
-          afterC=(diff?.geometry)?diff:null;
-        }catch(_){ /* mantém afterC=afterQ */ }
+// Extrai todos os segmentos dos anéis externos de polígonos GeoJSON.
+// Também devolve os vértices únicos (para interpolação de Z posterior).
+function extractBoundarySegs(features){
+  const segs=[],verts=[];
+  for(const f of features){
+    if(!f.geometry) continue;
+    const rings=(f.geometry.type==='Polygon'?[f.geometry.coordinates[0]]
+      :f.geometry.type==='MultiPolygon'?f.geometry.coordinates.map(p=>p[0]):[]);
+    for(const ring of rings){
+      for(let i=0;i<ring.length-1;i++){
+        segs.push([ring[i],ring[i+1]]);
+        verts.push(ring[i]);
       }
     }
+  }
+  return{segs,verts};
+}
 
-    // ── Fatia Rua (exclusão) ───────────────────────────────────
-    if(afterC?.geometry){
-      const r3D=injectZ(tri,{...afterC,properties:{...props,usage:'Rua'}});
-      if(r3D) flattenToPolygons(r3D).flatMap(retriangulate).forEach(f=>rFeats.push(f));
+// Encontra pontos onde linhas de curva de nível cruzam segmentos de fronteira.
+// Cada ponto retornado tem elevação absoluta (MSL) da curva que o gerou.
+function intersectContoursWithBoundaries(fcs,boundarySegs){
+  const pts=[];
+  for(const fc of fcs){
+    for(const f of(fc?.features||[])){
+      const elev=parseFloat(f.properties?.cd_numero_isovalor);
+      if(isNaN(elev)) continue;
+      const g=f.geometry;
+      const lines=g.type==='LineString'?[g.coordinates]
+        :g.type==='MultiLineString'?g.coordinates:[];
+      for(const ln of lines){
+        for(let i=0;i<ln.length-1;i++){
+          const p1=ln[i],p2=ln[i+1];
+          for(const[q1,q2] of boundarySegs){
+            const ix=segIntersect(p1,p2,q1,q2);
+            if(ix) pts.push({lng:ix[0],lat:ix[1],elev});
+          }
+        }
+      }
     }
   }
-
-  return{
-    Quadra:  {type:'FeatureCollection',features:qFeats},
-    Calçada: {type:'FeatureCollection',features:cFeats},
-    Rua:     {type:'FeatureCollection',features:rFeats},
-  };
+  return pts;
 }
 
-// ── Fan-triangulation: converte polígono arbitrário em triângulos ─
-// Necessário porque turf.intersect/difference pode gerar quadriláteros,
-// pentágonos etc. O pipeline de patches do Giraffe exige triângulos.
-// Fan a partir do vértice 0 — correto para polígonos convexos (caso
-// predominante ao clipar triângulos com polígonos de quadra/calçada).
-function retriangulate(feat){
-  const ring=feat.geometry.coordinates[0];
-  const n=ring.length-1; // exclui vértice de fechamento
-  if(n<=3) return[feat]; // já é triângulo
-  const props=feat.properties;
-  const tris=[];
-  for(let i=1;i<n-1;i++){
-    const A=ring[0],B=ring[i],C=ring[i+1];
-    // Filtra triângulos degenerados (área ≈ 0)
-    const area=(B[0]-A[0])*(C[1]-A[1])-(C[0]-A[0])*(B[1]-A[1]);
-    if(Math.abs(area)<1e-14) continue;
-    const avgH=((A[2]||0)+(B[2]||0)+(C[2]||0))/3;
-    tris.push({type:'Feature',
-      geometry:{type:'Polygon',coordinates:[[A,B,C,A]]},
-      properties:{...props,avgH}});
-  }
-  return tris.length?tris:[feat];
-}
 
 // ══════════════════════════════════════════════════════════════
 //  App
@@ -864,16 +807,18 @@ function App(){
     }
   };
 
-  // ─── Separar por Uso do Solo ─────────────────────────────────
-  // Busca quadras e calçadas do GeoSampa, constrói uniões e recorta
-  // o TIN geometricamente, publicando 3 camadas temp no Giraffe.
+  // ─── Separar por Uso do Solo (re-triangulação) ──────────────────
+  // Abordagem correta: em vez de clipar o TIN existente, enriquece o
+  // conjunto de pontos com as interseções curva×fronteira e re-triangula.
+  // Cada novo triângulo é classificado por centróide → sempre triângulos
+  // puros, alturas corretas, limites alinhados às fronteiras das camadas.
   const doSplit=async()=>{
-    if(!tin||busy||splitBusy) return;
+    if(!tin||!fcs||busy||splitBusy) return;
     setSplitBusy(true);
-    lg('info','━━ Separando terreno por uso do solo ━━');
+    lg('info','━━ Separando terreno por uso do solo (re-triangulação) ━━');
     try{
-      // 1. Buscar as duas camadas em paralelo
-      lg('info',`Buscando camadas GeoSampa: ${QUADRA_LAYER.split(':')[1]} e ${CALCADA_LAYER.split(':')[1]}...`);
+      // ── 1. Buscar quadras e calçadas em paralelo ──────────────
+      lg('info',`Buscando ${QUADRA_LAYER.split(':')[1]} e ${CALCADA_LAYER.split(':')[1]}...`);
       const[quadraRes,calcadaRes]=await Promise.allSettled([
         fetchWFS(QUADRA_LAYER,...geo.bbox,500,30000),
         fetchWFS(CALCADA_LAYER,...geo.bbox,500,30000),
@@ -882,22 +827,113 @@ function App(){
       const calcadaFeats=calcadaRes.status==='fulfilled'?(calcadaRes.value?.features||[]):[];
       if(quadraRes.status==='rejected')  lg('warn',`Quadras: ${(quadraRes.reason?.message||'erro').slice(0,60)}`);
       if(calcadaRes.status==='rejected') lg('warn',`Calçadas: ${(calcadaRes.reason?.message||'erro').slice(0,60)}`);
-      lg('ok',`Quadras: ${quadraFeats.length} feat. · Calçadas: ${calcadaFeats.length} feat.`);
-      if(!quadraFeats.length&&!calcadaFeats.length)
-        lg('warn','⚠ Sem dados de quadra/calçada — todo o terreno ficará como "Rua"');
+      lg('ok',`Quadras: ${quadraFeats.length} · Calçadas: ${calcadaFeats.length}`);
 
-      // 2. Construir uniões (dissolve) de cada camada
-      lg('info','Construindo uniões das camadas...');
-      const quadraUnion=unionMany(quadraFeats);
-      const calcadaUnion=unionMany(calcadaFeats);
+      // ── 2. Extrair segmentos e vértices das fronteiras ────────
+      const{segs:qSegs,verts:qVerts}=extractBoundarySegs(quadraFeats);
+      const{segs:cSegs,verts:cVerts}=extractBoundarySegs(calcadaFeats);
+      const allSegs=[...qSegs,...cSegs];
+      const allVerts=[...qVerts,...cVerts];
+      lg('info',`${allSegs.length} segmentos de fronteira extraídos`);
 
-      // 3. Recorte geométrico com interpolação Z
-      lg('info',`Recortando ${tin.features.length} triângulos — aguarde...`);
-      const result=splitTINByLandUse(tin,quadraUnion,calcadaUnion);
+      // ── 3. Pontos de interseção curva×fronteira ───────────────
+      // Cada ponto tem elevação absoluta (MSL) da curva de nível
+      const ixPts=intersectContoursWithBoundaries(fcs,allSegs);
+      lg('ok',`${ixPts.length} pontos curva×fronteira encontrados`);
+
+      // ── 4. Vértices de fronteira com Z do TIN ────────────────
+      // Converte Z relativo (TIN) → elevação absoluta (MSL)
+      const datum=stats.datum;
+      const bndPts=[];
+      const SNAP_B=5e-6;
+      const seenB=new Map();
+      for(const[lng,lat] of allVerts){
+        const k=`${lng/SNAP_B|0},${lat/SNAP_B|0}`;
+        if(seenB.has(k)) continue;
+        seenB.set(k,true);
+        const zRel=interpZFromTIN(lng,lat,tin.features);
+        if(zRel!==null) bndPts.push({lng,lat,elev:zRel+datum});
+      }
+      lg('ok',`${bndPts.length} vértices de fronteira com Z interpolado`);
+
+      // ── 5. Combinar todos os pontos e clipar ao buffer ────────
+      const basePts=samplePoints(fcs); // pontos originais das curvas
+      const allPts=[...basePts,...ixPts,...bndPts];
+      const bufFeat=turf.buffer(
+        {type:'Feature',geometry:geo.geom,properties:{}},buf,{units:'meters'}
+      );
+      const clipped=allPts.filter(p=>
+        turf.booleanPointInPolygon([p.lng,p.lat],bufFeat)
+      );
+      lg('info',`${basePts.length} pts base + ${ixPts.length} ix + ${bndPts.length} bnd = ${clipped.length} após clip`);
+      if(clipped.length<4) throw new Error('Pontos insuficientes para re-triangular');
+
+      // ── 6. Deduplicar e re-triangular (Delaunay) ──────────────
+      const SNAP=5e-6;
+      const seen=new Map();
+      const cl=[];
+      for(const p of clipped){
+        const k=`${p.lng/SNAP|0},${p.lat/SNAP|0}`;
+        if(!seen.has(k)){seen.set(k,true);cl.push(p);}
+      }
+      const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
+      const d=new Delaunator(cl.flatMap(p=>[p.lng,p.lat]));
+
+      // Limiar de aresta adaptativo (mesmo algoritmo do buildTIN)
+      const samp=[];
+      for(let i=0;i<Math.min(d.triangles.length,1200);i+=3){
+        const A=cl[d.triangles[i]],B=cl[d.triangles[i+1]];
+        samp.push(Math.hypot(A.lng-B.lng,A.lat-B.lat));
+      }
+      samp.sort((a,b)=>a-b);
+      const maxEdge=Math.max((samp[samp.length>>1]||0.001)*7,3e-4);
+
+      // ── 7. Construir triângulos e classificar por centróide ───
+      const qFeats=[],cFeats=[],rFeats=[];
+      for(let i=0;i<d.triangles.length;i+=3){
+        const A=cl[d.triangles[i]],B=cl[d.triangles[i+1]],C=cl[d.triangles[i+2]];
+        if(Math.max(
+          Math.hypot(A.lng-B.lng,A.lat-B.lat),
+          Math.hypot(B.lng-C.lng,B.lat-C.lat),
+          Math.hypot(C.lng-A.lng,C.lat-A.lat)
+        )>maxEdge) continue;
+        const ha=Math.max(0,A.elev-datum);
+        const hb=Math.max(0,B.elev-datum);
+        const hc=Math.max(0,C.elev-datum);
+        const avgH=(ha+hb+hc)/3;
+        const feat={
+          type:'Feature',
+          properties:{avgH,ha,hb,hc},
+          geometry:{type:'Polygon',
+            coordinates:[[[A.lng,A.lat,ha],[B.lng,B.lat,hb],[C.lng,C.lat,hc],[A.lng,A.lat,ha]]]}
+        };
+        // Centróide 2D para point-in-polygon
+        const cx=(A.lng+B.lng+C.lng)/3;
+        const cy=(A.lat+B.lat+C.lat)/3;
+        const pt=turf.point([cx,cy]);
+        let usage='Rua';
+        for(const qf of quadraFeats){
+          try{if(turf.booleanPointInPolygon(pt,qf)){usage='Quadra';break;}}catch(_){}
+        }
+        if(usage==='Rua'){
+          for(const cf of calcadaFeats){
+            try{if(turf.booleanPointInPolygon(pt,cf)){usage='Calçada';break;}}catch(_){}
+          }
+        }
+        feat.properties.usage=usage;
+        if(usage==='Quadra') qFeats.push(feat);
+        else if(usage==='Calçada') cFeats.push(feat);
+        else rFeats.push(feat);
+      }
+      const result={
+        Quadra:  {type:'FeatureCollection',features:qFeats},
+        Calçada: {type:'FeatureCollection',features:cFeats},
+        Rua:     {type:'FeatureCollection',features:rFeats},
+      };
       const counts=Object.entries(result).map(([k,v])=>`${v.features.length} ${k}`).join(' · ');
-      lg('ok',`Split: ${counts}`);
+      lg('ok',`Triâng.: ${counts}`);
 
-      // 4. Publicar 3 camadas temporárias (remove preview combinado)
+      // ── 8. Publicar 3 camadas temporárias ────────────────────
       try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
       for(const[cat,fc] of Object.entries(result)){
         const id=SPLIT_IDS[cat];
@@ -915,7 +951,7 @@ function App(){
       }
       setSplitFcs(result);
       setSplitVis({Quadra:true,Calçada:true,Rua:true});
-      lg('ok','✓ 3 camadas publicadas. Clique nos botões para ocultar/mostrar cada uso.');
+      lg('ok','✓ 3 camadas publicadas. Clique nos botões para ocultar/mostrar.');
     }catch(e){
       lg('err',`Separação: ${e.message}`);
     }finally{
