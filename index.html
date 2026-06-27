@@ -432,7 +432,7 @@ function splitTINByLandUse(tinResult,quadraUnion,calcadaUnion){
         const qPart=turf.intersect(tri2D,quadraUnion);
         if(qPart?.geometry){
           const q3D=injectZ(tri,{...qPart,properties:{...props,usage:'Quadra'}});
-          if(q3D) flattenToPolygons(q3D).forEach(f=>qFeats.push(f));
+          if(q3D) flattenToPolygons(q3D).flatMap(retriangulate).forEach(f=>qFeats.push(f));
         }
         const diff=turf.difference(tri2D,quadraUnion);
         afterQ=(diff?.geometry)?diff:null;
@@ -448,7 +448,7 @@ function splitTINByLandUse(tinResult,quadraUnion,calcadaUnion){
           const cPart=turf.intersect(afterQ,calcadaUnion);
           if(cPart?.geometry){
             const c3D=injectZ(tri,{...cPart,properties:{...props,usage:'Calçada'}});
-            if(c3D) flattenToPolygons(c3D).forEach(f=>cFeats.push(f));
+            if(c3D) flattenToPolygons(c3D).flatMap(retriangulate).forEach(f=>cFeats.push(f));
           }
           const diff=turf.difference(afterQ,calcadaUnion);
           afterC=(diff?.geometry)?diff:null;
@@ -459,7 +459,7 @@ function splitTINByLandUse(tinResult,quadraUnion,calcadaUnion){
     // ── Fatia Rua (exclusão) ───────────────────────────────────
     if(afterC?.geometry){
       const r3D=injectZ(tri,{...afterC,properties:{...props,usage:'Rua'}});
-      if(r3D) flattenToPolygons(r3D).forEach(f=>rFeats.push(f));
+      if(r3D) flattenToPolygons(r3D).flatMap(retriangulate).forEach(f=>rFeats.push(f));
     }
   }
 
@@ -468,6 +468,30 @@ function splitTINByLandUse(tinResult,quadraUnion,calcadaUnion){
     Calçada: {type:'FeatureCollection',features:cFeats},
     Rua:     {type:'FeatureCollection',features:rFeats},
   };
+}
+
+// ── Fan-triangulation: converte polígono arbitrário em triângulos ─
+// Necessário porque turf.intersect/difference pode gerar quadriláteros,
+// pentágonos etc. O pipeline de patches do Giraffe exige triângulos.
+// Fan a partir do vértice 0 — correto para polígonos convexos (caso
+// predominante ao clipar triângulos com polígonos de quadra/calçada).
+function retriangulate(feat){
+  const ring=feat.geometry.coordinates[0];
+  const n=ring.length-1; // exclui vértice de fechamento
+  if(n<=3) return[feat]; // já é triângulo
+  const props=feat.properties;
+  const tris=[];
+  for(let i=1;i<n-1;i++){
+    const A=ring[0],B=ring[i],C=ring[i+1];
+    // Filtra triângulos degenerados (área ≈ 0)
+    const area=(B[0]-A[0])*(C[1]-A[1])-(C[0]-A[0])*(B[1]-A[1]);
+    if(Math.abs(area)<1e-14) continue;
+    const avgH=((A[2]||0)+(B[2]||0)+(C[2]||0))/3;
+    tris.push({type:'Feature',
+      geometry:{type:'Polygon',coordinates:[[A,B,C,A]]},
+      properties:{...props,avgH}});
+  }
+  return tris.length?tris:[feat];
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -739,86 +763,100 @@ function App(){
   };
 
   // ─── Fixar como patches editáveis ──────────────────────────────────────────
+  // Se splitFcs estiver disponível (✂ Separar foi executado), itera pelas
+  // 3 categorias em sequência. Caso contrário, usa o TIN combinado.
   const doFixar=async()=>{
     if(!tin||phase!=='r_patch'||busy) return;
     setPhase('patch');setPct(0);
-    lg('info','━━ Criando patches 3D no projeto ━━');
+
+    // Fonte de dados: split ou TIN inteiro
+    const cats=splitFcs
+      ?Object.entries(splitFcs)           // [{Quadra:FC},{Calçada:FC},{Rua:FC}]
+      :[['Terreno',tin]];                 // fallback: tudo num só
+    const nCats=cats.length;
+    lg('info',`━━ Criando patches 3D — ${nCats===1?'terreno unificado':`${nCats} categorias`} ━━`);
+
     try{
-      // Filtra triângulos degenerados
-      const valid=tin.features.filter(f=>{
-        const ring=f.geometry.coordinates[0];
-        if(!ring||ring.length<4) return false;
-        const[[ax,ay],[bx,by],[cx,cy]]=ring;
-        return[ax,ay,bx,by,cx,cy].every(Number.isFinite)
-          &&Math.abs((bx-ax)*(cy-ay)-(cx-ax)*(by-ay))>1e-12;
-      });
-      const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
-      lg('info',`${valid.length} triângulos | alturas Z: ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)} m`);
-      setPct(5);
+      let totalFixed=0;
 
-      // ── Passo 1: importRawSections SEM patch (geometria 3D como referência)
-      // Giraffe pode reordenar o anel — por isso NÃO passamos patch agora
-      // As alturas estão codificadas no Z [lng,lat,height] de cada vértice
-      const plainFeats=valid.map(f=>({
-        type:'Feature',
-        geometry:f.geometry,        // 3D: [lng,lat,height] por vértice
-        properties:{stackOrder:0,layerId:'default'}
-      }));
-      lg('info',`Passo 1: importRawSections (${valid.length} polígonos, sem patch)...`);
-      setPct(10);
+      for(let ci=0;ci<nCats;ci++){
+        const[cat,fc]=cats[ci];
+        // Faixas de progresso por categoria
+        const p0=Math.round(ci/nCats*100);
+        const p1=Math.round((ci+1)/nCats*100);
+        const pp=t=>p0+Math.round((p1-p0)*t);
 
-      const imported=await rpc.invoke('importRawSections',[plainFeats]);
-      if(!Array.isArray(imported)||!imported.length)
-        throw new Error(`importRawSections não retornou array: ${JSON.stringify(imported)?.slice(0,80)}`);
-      lg('ok',`${imported.length} seções criadas. Detectando ordem real dos vértices...`);
-      setPct(50);
+        // ── Filtrar degenerados ─────────────────────────────────
+        const valid=fc.features.filter(f=>{
+          const ring=f.geometry.coordinates[0];
+          if(!ring||ring.length<4) return false;
+          const[[ax,ay],[bx,by],[cx,cy]]=ring;
+          return[ax,ay,bx,by,cx,cy].every(Number.isFinite)
+            &&Math.abs((bx-ax)*(cy-ay)-(cx-ax)*(by-ay))>1e-12;
+        });
+        if(!valid.length){lg('warn',`${cat}: sem triângulos válidos — pulando.`);continue;}
+        const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
+        lg('info',`${cat}: ${valid.length} triângulos | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)} m`);
+        setPct(pp(.05));
 
-      // ── Passo 2: para cada feature importada, reconstruir patch[] na ORDEM REAL
-      // importRawSections pode ter reordenado os vértices → precisamos alinhar as alturas
-      // Fazemos matching por coordenada lng/lat entre o anel importado e o original (com Z)
-      const updates=imported.map((impFeat,i)=>{
-        const origRing=valid[i].geometry.coordinates[0]; // [lng,lat,Z] original
-        const impRing=impFeat.geometry?.coordinates?.[0]; // [lng,lat] como Giraffe salvou
+        // ── Passo 1: importRawSections ──────────────────────────
+        // Giraffe pode reordenar o anel — alturas codificadas em Z [lng,lat,h]
+        const plainFeats=valid.map(f=>({
+          type:'Feature',
+          geometry:f.geometry,
+          properties:{stackOrder:0,layerId:'default',usage:cat}
+        }));
+        lg('info',`${cat}: importRawSections (${valid.length} polígonos)...`);
+        setPct(pp(.10));
 
-        let patch;
-        if(impRing&&impRing.length>=3){
-          // Para cada vértice da ordem do Giraffe, encontra a altura do vértice original mais próximo
-          patch=impRing.slice(0,3).map(([impLng,impLat])=>{
-            let bestH=0,bestDist=Infinity;
-            for(const[origLng,origLat,origH=0] of origRing.slice(0,3)){
-              const d=Math.hypot(impLng-origLng,impLat-origLat);
-              if(d<bestDist){bestDist=d;bestH=origH;}
-            }
-            return parseFloat(bestH.toFixed(4));
-          });
-        }else{
-          // Fallback: usa a ordem original se não conseguiu geometria importada
-          patch=origRing.slice(0,3).map(v=>parseFloat((v[2]||0).toFixed(4)));
-        }
+        const imported=await rpc.invoke('importRawSections',[plainFeats]);
+        if(!Array.isArray(imported)||!imported.length)
+          throw new Error(`${cat}: importRawSections não retornou array: ${JSON.stringify(imported)?.slice(0,80)}`);
+        lg('ok',`${cat}: ${imported.length} seções. Alinhando alturas...`);
+        setPct(pp(.50));
 
-        return{
-          properties:{
-            id:impFeat.properties?.id,
-            patch,
-            patchType:'slab',
+        // ── Passo 2: reconstruir patch na ordem real dos vértices ─
+        // Nearest-neighbor: para cada vértice retornado pelo Giraffe,
+        // encontra o vértice original (com Z) mais próximo em lng/lat.
+        const updates=imported.map((impFeat,i)=>{
+          const origRing=valid[i].geometry.coordinates[0]; // [lng,lat,Z]
+          const impRing=impFeat.geometry?.coordinates?.[0];
+          let patch;
+          if(impRing&&impRing.length>=3){
+            patch=impRing.slice(0,3).map(([impLng,impLat])=>{
+              let bestH=0,bestDist=Infinity;
+              for(const[oLng,oLat,oH=0] of origRing.slice(0,3)){
+                const d=Math.hypot(impLng-oLng,impLat-oLat);
+                if(d<bestDist){bestDist=d;bestH=oH;}
+              }
+              return parseFloat(bestH.toFixed(4));
+            });
+          }else{
+            patch=origRing.slice(0,3).map(v=>parseFloat((v[2]||0).toFixed(4)));
           }
-        };
-      });
+          return{properties:{id:impFeat.properties?.id,patch,patchType:'slab',usage:cat}};
+        });
 
-      // Log diagnóstico
-      const hasId=updates.filter(u=>u.properties.id).length;
-      lg('info',`${hasId}/${updates.length} IDs capturados. patch[0]=[${updates[0].properties.patch.join(',')}]`);
-      if(hasId<updates.length) lg('warn',`${updates.length-hasId} features sem ID — updateRawSections pode falhar nelas`);
-      setPct(70);
+        const hasId=updates.filter(u=>u.properties.id).length;
+        lg('info',`${cat}: ${hasId}/${updates.length} IDs. patch[0]=[${updates[0]?.properties.patch.join(',')}]`);
+        if(hasId<updates.length) lg('warn',`${cat}: ${updates.length-hasId} sem ID.`);
+        setPct(pp(.70));
 
-      // ── Passo 3: updateRawSections com patch na ordem correta do Giraffe
-      const validUpdates=updates.filter(u=>u.properties.id);
-      await rpc.invoke('updateRawSections',[validUpdates]);
-      setPct(95);
+        // ── Passo 3: updateRawSections ──────────────────────────
+        const validUpdates=updates.filter(u=>u.properties.id);
+        await rpc.invoke('updateRawSections',[validUpdates]);
+        totalFixed+=validUpdates.length;
+        setPct(pp(.95));
+        lg('ok',`${cat}: ✓ ${validUpdates.length} patches aplicados.`);
+      }
 
+      // Remove previews temporários
       try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
+      for(const id of Object.values(SPLIT_IDS)){
+        try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
+      }
       setPct(100);
-      lg('ok',`✓ ${validUpdates.length} patches 3D aplicados com altura por vértice corrigida!`);
+      lg('ok',`✓ ${totalFixed} patches 3D — ${nCats} categoria(s) fixadas!`);
       setPhase('done');
     }catch(e){
       lg('err',`Erro: ${e.message}`);
