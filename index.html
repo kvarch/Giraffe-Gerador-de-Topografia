@@ -326,19 +326,15 @@ const CURVAS_TEMP_ID='kv-curvas-3d';
 const CURVAS_PERM_NAME='Curvas de Nível · GeoSampa';
 
 // ══════════════════════════════════════════════════════════════
-// ══════════════════════════════════════════════════════════════
-//  Separação por Uso do Solo — nova abordagem: re-triangulação
+//  Separação por Uso do Solo — Drape + Re-triangulação por Plano
 //
-//  Em vez de clipar triângulos existentes (que produz polígonos
-//  de formato arbitrário e Z difícil de preservar), a estratégia
-//  correta é:
-//    1. Encontrar onde as curvas de nível cruzam as fronteiras de
-//       quadra/calçada → pontos com elevação exata (da curva)
-//    2. Interpolar Z dos vértices das fronteiras via TIN existente
-//    3. Re-triangular tudo junto (Delaunay)
-//    4. Classificar cada triângulo resultante por centróide
-//  Resultado: triângulos puros, alturas sempre corretas, limites
-//  naturalmente alinhados com as fronteiras das camadas.
+//  Estratégia:
+//    1. Adensamento (densify) das fronteiras de quadra/calçada a cada ~5m
+//    2. Para cada vértice adensado: busca do triângulo do TIN que o contém
+//       em projeção 2D, depois aplica a Equação do Plano para obter Z exato
+//    3. Triangulação independente por categoria (Delaunay) dos pontos draped
+//    4. Rua: triângulos originais do TIN cujo centróide não está em nenhuma
+//       quadra nem calçada (não precisa re-triangular)
 // ══════════════════════════════════════════════════════════════
 
 const QUADRA_LAYER  = 'geoportal:quadra_viaria_editada'; // confirmado via GetCapabilities
@@ -346,95 +342,144 @@ const CALCADA_LAYER = 'geoportal:calcada';               // confirmado via GetCa
 const SPLIT_IDS    = {Quadra:'kv-split-quadra', Calçada:'kv-split-calcada', Rua:'kv-split-rua'};
 const SPLIT_COLORS = {Quadra:'#c87137', Calçada:'#7a8fa6', Rua:'#3a3a3a'};
 
-// Interpolação baricêntrica de Z em triângulo 3D A-B-C para ponto 2D [px,py]
-function interpZ(A,B,C,px,py){
-  const[ax,ay,az=0]=A,[bx,by,bz=0]=B,[cx,cy,cz=0]=C;
-  const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
-  if(Math.abs(det)<1e-14) return(az+bz+cz)/3;
-  const w1=((by-cy)*(px-cx)+(cx-bx)*(py-cy))/det;
-  const w2=((cy-ay)*(px-cx)+(ax-cx)*(py-cy))/det;
-  return Math.max(0,w1*az+w2*bz+(1-w1-w2)*cz);
-}
-
-// Interpola Z relativo em ponto [lng,lat] varrendoo TIN já construído.
-// Os triângulos do TIN têm coordenadas [lng,lat,z_relativo].
-// Retorna z_relativo ou null se o ponto estiver fora do TIN.
-function interpZFromTIN(lng,lat,tinFeatures){
+// ── Equação do Plano ──────────────────────────────────────────────
+// Dado ponto 2D (lng, lat) e os 3 vértices do triângulo do TIN,
+// retorna o Z relativo exato usando a Equação do Plano.
+//
+// Passo 1: teste baricêntrico 2D para confirmar que o ponto está
+//          dentro deste triângulo (base perfeitamente plana, como
+//          descrito pelo Giraffe — alturas controladas independentemente).
+// Passo 2: normal do plano N = v1 × v2, onde v1=P2-P1, v2=P3-P1.
+//          Z = -(A·X + B·Y + D) / C, onde D = -(A·P1x + B·P1y + C·P1z)
+//
+// Nota: X,Y em graus, Z em metros — o teste baricêntrico usa apenas
+// a projeção 2D (estável); a eq. do plano opera nos 3 eixos corretos.
+function getZAtPoint(lng,lat,tinFeatures){
   for(const tri of tinFeatures){
     const ring=tri.geometry.coordinates[0];
-    const[A,B,C]=ring;
-    const[ax,ay,az=0]=A,[bx,by,bz=0]=B,[cx,cy,cz=0]=C;
+    // Vértices: [lng, lat, z_relativo]
+    const[ax,ay,az=0]=ring[0],[bx,by,bz=0]=ring[1],[cx,cy,cz=0]=ring[2];
+
+    // Teste baricêntrico 2D — localiza triângulo na projeção plana
     const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
     if(Math.abs(det)<1e-14) continue;
     const w1=((by-cy)*(lng-cx)+(cx-bx)*(lat-cy))/det;
     const w2=((cy-ay)*(lng-cx)+(ax-cx)*(lat-cy))/det;
     const w3=1-w1-w2;
-    if(w1>=-1e-3&&w2>=-1e-3&&w3>=-1e-3)
-      return Math.max(0,w1*az+w2*bz+w3*cz);
+    if(w1<-1e-3||w2<-1e-3||w3<-1e-3) continue;
+
+    // Vetores do triângulo em 3D (v1=P2-P1, v2=P3-P1)
+    const v1x=bx-ax,v1y=by-ay,v1z=bz-az;
+    const v2x=cx-ax,v2y=cy-ay,v2z=cz-az;
+    // Normal = v1 × v2  →  (A, B, C)
+    const A=v1y*v2z-v1z*v2y;
+    const B=v1z*v2x-v1x*v2z;
+    const C=v1x*v2y-v1y*v2x;
+    // Equação do plano: A·X + B·Y + C·Z + D = 0
+    const D=-(A*ax+B*ay+C*az);
+    // Resolver para Z: Z = -(A·X + B·Y + D) / C
+    // Se C ≈ 0 (plano vertical ou degenerado), usa fallback baricêntrico
+    if(Math.abs(C)<1e-12) return Math.max(0,w1*az+w2*bz+w3*cz);
+    return Math.max(0,-(A*lng+B*lat+D)/C);
   }
-  return null;
+  return null; // ponto fora de todos os triângulos do TIN
 }
 
-// Interseção de dois segmentos de linha com pré-filtro bbox (rápido).
-// Retorna ponto [x,y] ou null se não há interseção no intervalo [0,1].
-function segIntersect(p1,p2,p3,p4){
-  // Bbox check
-  if(Math.max(p1[0],p2[0])<Math.min(p3[0],p4[0])||
-     Math.min(p1[0],p2[0])>Math.max(p3[0],p4[0])||
-     Math.max(p1[1],p2[1])<Math.min(p3[1],p4[1])||
-     Math.min(p1[1],p2[1])>Math.max(p3[1],p4[1])) return null;
-  const dx1=p2[0]-p1[0],dy1=p2[1]-p1[1];
-  const dx2=p4[0]-p3[0],dy2=p4[1]-p3[1];
-  const cross=dx1*dy2-dy1*dx2;
-  if(Math.abs(cross)<1e-14) return null;
-  const t=((p3[0]-p1[0])*dy2-(p3[1]-p1[1])*dx2)/cross;
-  const u=((p3[0]-p1[0])*dy1-(p3[1]-p1[1])*dx1)/cross;
-  if(t>=0&&t<=1&&u>=0&&u<=1) return[p1[0]+t*dx1,p1[1]+t*dy1];
-  return null;
-}
-
-// Extrai todos os segmentos dos anéis externos de polígonos GeoJSON.
-// Também devolve os vértices únicos (para interpolação de Z posterior).
-function extractBoundarySegs(features){
-  const segs=[],verts=[];
-  for(const f of features){
-    if(!f.geometry) continue;
-    const rings=(f.geometry.type==='Polygon'?[f.geometry.coordinates[0]]
-      :f.geometry.type==='MultiPolygon'?f.geometry.coordinates.map(p=>p[0]):[]);
-    for(const ring of rings){
-      for(let i=0;i<ring.length-1;i++){
-        segs.push([ring[i],ring[i+1]]);
-        verts.push(ring[i]);
+// ── Adensamento de anel ───────────────────────────────────────────
+// Insere vértices intermediários a cada stepDeg graus.
+// 5 m ≈ 5/111320 ≈ 4.5e-5 graus em São Paulo.
+function densifyRing(ring,stepDeg){
+  if(!ring||ring.length<3) return ring;
+  const out=[];
+  for(let i=0;i<ring.length-1;i++){
+    const p1=ring[i],p2=ring[i+1];
+    out.push(p1);
+    const d=Math.hypot(p2[0]-p1[0],p2[1]-p1[1]);
+    if(d>stepDeg){
+      const n=Math.ceil(d/stepDeg);
+      for(let j=1;j<n;j++){
+        const t=j/n;
+        out.push([p1[0]+t*(p2[0]-p1[0]),p1[1]+t*(p2[1]-p1[1])]);
       }
     }
   }
-  return{segs,verts};
+  out.push(out[0]); // fechar anel
+  return out;
 }
 
-// Encontra pontos onde linhas de curva de nível cruzam segmentos de fronteira.
-// Cada ponto retornado tem elevação absoluta (MSL) da curva que o gerou.
-function intersectContoursWithBoundaries(fcs,boundarySegs){
-  const pts=[];
-  for(const fc of fcs){
-    for(const f of(fc?.features||[])){
-      const elev=parseFloat(f.properties?.cd_numero_isovalor);
-      if(isNaN(elev)) continue;
-      const g=f.geometry;
-      const lines=g.type==='LineString'?[g.coordinates]
-        :g.type==='MultiLineString'?g.coordinates:[];
-      for(const ln of lines){
-        for(let i=0;i<ln.length-1;i++){
-          const p1=ln[i],p2=ln[i+1];
-          for(const[q1,q2] of boundarySegs){
-            const ix=segIntersect(p1,p2,q1,q2);
-            if(ix) pts.push({lng:ix[0],lat:ix[1],elev});
-          }
-        }
+// ── Drape + Triangulação de um único polígono GeoJSON ─────────────
+// Para cada anel externo do polígono:
+//   1. Adensa a fronteira (densifyRing)
+//   2. Projeta cada vértice sobre o TIN (getZAtPoint → equação do plano)
+//   3. Coleta vértices internos do TIN que caem dentro do polígono
+//      (adiciona detalhe do relevo no interior, não apenas na borda)
+//   4. Triangula tudo com Delaunator
+//   5. Filtra triângulos cujo centróide está fora do polígono
+// Empurra os triângulos válidos para o array `output`.
+function drapeAndTriangulate(feat,tinFeatures,stepDeg,Delaunator,usage,output){
+  if(!feat?.geometry) return;
+  const polys=feat.geometry.type==='Polygon'?[feat.geometry.coordinates]
+    :feat.geometry.type==='MultiPolygon'?feat.geometry.coordinates:[];
+
+  for(const polyCoords of polys){
+    const outer=polyCoords[0];
+    if(!outer||outer.length<4) continue;
+
+    // 1. Adensamento + drape da fronteira
+    const dense=densifyRing(outer,stepDeg);
+    const ring3D=dense.map(([lng,lat])=>{
+      const z=getZAtPoint(lng,lat,tinFeatures);
+      return[lng,lat,z!==null?z:0];
+    });
+
+    // Feature 2D para filtro de centróide (sem Z)
+    const poly2D={type:'Feature',geometry:{type:'Polygon',
+      coordinates:[outer.map(p=>[p[0],p[1]])]}};
+
+    // 2. Vértices do TIN que caem DENTRO do polígono (detalhe interior)
+    const interior=[];
+    for(const tri of tinFeatures){
+      const r=tri.geometry.coordinates[0];
+      for(const v of r.slice(0,3)){
+        try{
+          if(turf.booleanPointInPolygon(turf.point([v[0],v[1]]),poly2D))
+            interior.push([v[0],v[1],v[2]||0]);
+        }catch(_){}
       }
     }
+
+    // 3. Combinar + deduplicar (fronteira adensada + interior do TIN)
+    const SNAP=5e-7;
+    const seen=new Map();
+    const pts=[];
+    for(const p of[...ring3D,...interior]){
+      const k=`${(p[0]/SNAP)|0},${(p[1]/SNAP)|0}`;
+      if(!seen.has(k)){seen.set(k,true);pts.push(p);}
+    }
+    if(pts.length<3) continue;
+
+    // 4. Triangulação Delaunay
+    const d=new Delaunator(pts.flatMap(p=>[p[0],p[1]]));
+
+    for(let i=0;i<d.triangles.length;i+=3){
+      const A=pts[d.triangles[i]],B=pts[d.triangles[i+1]],C=pts[d.triangles[i+2]];
+      // Área mínima
+      const area=(B[0]-A[0])*(C[1]-A[1])-(C[0]-A[0])*(B[1]-A[1]);
+      if(Math.abs(area)<1e-14) continue;
+      // Filtro: centróide deve estar dentro do polígono
+      const cx=(A[0]+B[0]+C[0])/3,cy=(A[1]+B[1]+C[1])/3;
+      try{if(!turf.booleanPointInPolygon(turf.point([cx,cy]),poly2D)) continue;}
+      catch(_){continue;}
+      const ha=A[2],hb=B[2],hc=C[2];
+      output.push({type:'Feature',
+        properties:{avgH:(ha+hb+hc)/3,ha,hb,hc,usage},
+        geometry:{type:'Polygon',
+          coordinates:[[[A[0],A[1],ha],[B[0],B[1],hb],[C[0],C[1],hc],[A[0],A[1],ha]]]}});
+    }
   }
-  return pts;
 }
+
+
 
 
 // ══════════════════════════════════════════════════════════════
@@ -807,17 +852,18 @@ function App(){
     }
   };
 
-  // ─── Separar por Uso do Solo (re-triangulação) ──────────────────
-  // Abordagem correta: em vez de clipar o TIN existente, enriquece o
-  // conjunto de pontos com as interseções curva×fronteira e re-triangula.
-  // Cada novo triângulo é classificado por centróide → sempre triângulos
-  // puros, alturas corretas, limites alinhados às fronteiras das camadas.
+  // ─── Separar por Uso do Solo — Drape sobre o TIN ───────────────
+  // 1. Busca quadras + calçadas do GeoSampa
+  // 2. Adensa fronteiras (~5m), drape cada vértice sobre o TIN
+  //    usando equação do plano (getZAtPoint)
+  // 3. Triangula cada categoria independentemente (Delaunay)
+  // 4. Rua = triângulos originais do TIN fora de quadras e calçadas
   const doSplit=async()=>{
-    if(!tin||!fcs||busy||splitBusy) return;
+    if(!tin||busy||splitBusy) return;
     setSplitBusy(true);
-    lg('info','━━ Separando terreno por uso do solo (re-triangulação) ━━');
+    lg('info','━━ Separando por uso do solo (drape + eq. plano) ━━');
     try{
-      // ── 1. Buscar quadras e calçadas em paralelo ──────────────
+      // 1. Buscar as camadas em paralelo
       lg('info',`Buscando ${QUADRA_LAYER.split(':')[1]} e ${CALCADA_LAYER.split(':')[1]}...`);
       const[quadraRes,calcadaRes]=await Promise.allSettled([
         fetchWFS(QUADRA_LAYER,...geo.bbox,500,30000),
@@ -825,115 +871,56 @@ function App(){
       ]);
       const quadraFeats=quadraRes.status==='fulfilled'?(quadraRes.value?.features||[]):[];
       const calcadaFeats=calcadaRes.status==='fulfilled'?(calcadaRes.value?.features||[]):[];
-      if(quadraRes.status==='rejected')  lg('warn',`Quadras: ${(quadraRes.reason?.message||'erro').slice(0,60)}`);
-      if(calcadaRes.status==='rejected') lg('warn',`Calçadas: ${(calcadaRes.reason?.message||'erro').slice(0,60)}`);
+      if(quadraRes.status==='rejected')  lg('warn',`Quadras: ${(quadraRes.reason?.message||'err').slice(0,60)}`);
+      if(calcadaRes.status==='rejected') lg('warn',`Calçadas: ${(calcadaRes.reason?.message||'err').slice(0,60)}`);
       lg('ok',`Quadras: ${quadraFeats.length} · Calçadas: ${calcadaFeats.length}`);
 
-      // ── 2. Extrair segmentos e vértices das fronteiras ────────
-      const{segs:qSegs,verts:qVerts}=extractBoundarySegs(quadraFeats);
-      const{segs:cSegs,verts:cVerts}=extractBoundarySegs(calcadaFeats);
-      const allSegs=[...qSegs,...cSegs];
-      const allVerts=[...qVerts,...cVerts];
-      lg('info',`${allSegs.length} segmentos de fronteira extraídos`);
+      // 5 m em graus (aprox. para SP ~23°S)
+      const STEP_DEG=5/111320;
 
-      // ── 3. Pontos de interseção curva×fronteira ───────────────
-      // Cada ponto tem elevação absoluta (MSL) da curva de nível
-      const ixPts=intersectContoursWithBoundaries(fcs,allSegs);
-      lg('ok',`${ixPts.length} pontos curva×fronteira encontrados`);
-
-      // ── 4. Vértices de fronteira com Z do TIN ────────────────
-      // Converte Z relativo (TIN) → elevação absoluta (MSL)
-      const datum=stats.datum;
-      const bndPts=[];
-      const SNAP_B=5e-6;
-      const seenB=new Map();
-      for(const[lng,lat] of allVerts){
-        const k=`${lng/SNAP_B|0},${lat/SNAP_B|0}`;
-        if(seenB.has(k)) continue;
-        seenB.set(k,true);
-        const zRel=interpZFromTIN(lng,lat,tin.features);
-        if(zRel!==null) bndPts.push({lng,lat,elev:zRel+datum});
-      }
-      lg('ok',`${bndPts.length} vértices de fronteira com Z interpolado`);
-
-      // ── 5. Combinar todos os pontos e clipar ao buffer ────────
-      const basePts=samplePoints(fcs); // pontos originais das curvas
-      const allPts=[...basePts,...ixPts,...bndPts];
-      const bufFeat=turf.buffer(
-        {type:'Feature',geometry:geo.geom,properties:{}},buf,{units:'meters'}
-      );
-      const clipped=allPts.filter(p=>
-        turf.booleanPointInPolygon([p.lng,p.lat],bufFeat)
-      );
-      lg('info',`${basePts.length} pts base + ${ixPts.length} ix + ${bndPts.length} bnd = ${clipped.length} após clip`);
-      if(clipped.length<4) throw new Error('Pontos insuficientes para re-triangular');
-
-      // ── 6. Deduplicar e re-triangular (Delaunay) ──────────────
-      const SNAP=5e-6;
-      const seen=new Map();
-      const cl=[];
-      for(const p of clipped){
-        const k=`${p.lng/SNAP|0},${p.lat/SNAP|0}`;
-        if(!seen.has(k)){seen.set(k,true);cl.push(p);}
-      }
       const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
-      const d=new Delaunator(cl.flatMap(p=>[p.lng,p.lat]));
 
-      // Limiar de aresta adaptativo (mesmo algoritmo do buildTIN)
-      const samp=[];
-      for(let i=0;i<Math.min(d.triangles.length,1200);i+=3){
-        const A=cl[d.triangles[i]],B=cl[d.triangles[i+1]];
-        samp.push(Math.hypot(A.lng-B.lng,A.lat-B.lat));
-      }
-      samp.sort((a,b)=>a-b);
-      const maxEdge=Math.max((samp[samp.length>>1]||0.001)*7,3e-4);
+      // 2. Drape + triangular QUADRAS
+      lg('info',`Drapejando ${quadraFeats.length} quadras (adensamento ${(STEP_DEG*1000).toFixed(2)}m)...`);
+      const qFeats=[];
+      for(const feat of quadraFeats)
+        drapeAndTriangulate(feat,tin.features,STEP_DEG,Delaunator,'Quadra',qFeats);
+      lg('ok',`Quadra: ${qFeats.length} triângulos`);
 
-      // ── 7. Construir triângulos e classificar por centróide ───
-      const qFeats=[],cFeats=[],rFeats=[];
-      for(let i=0;i<d.triangles.length;i+=3){
-        const A=cl[d.triangles[i]],B=cl[d.triangles[i+1]],C=cl[d.triangles[i+2]];
-        if(Math.max(
-          Math.hypot(A.lng-B.lng,A.lat-B.lat),
-          Math.hypot(B.lng-C.lng,B.lat-C.lat),
-          Math.hypot(C.lng-A.lng,C.lat-A.lat)
-        )>maxEdge) continue;
-        const ha=Math.max(0,A.elev-datum);
-        const hb=Math.max(0,B.elev-datum);
-        const hc=Math.max(0,C.elev-datum);
-        const avgH=(ha+hb+hc)/3;
-        const feat={
-          type:'Feature',
-          properties:{avgH,ha,hb,hc},
-          geometry:{type:'Polygon',
-            coordinates:[[[A.lng,A.lat,ha],[B.lng,B.lat,hb],[C.lng,C.lat,hc],[A.lng,A.lat,ha]]]}
-        };
-        // Centróide 2D para point-in-polygon
-        const cx=(A.lng+B.lng+C.lng)/3;
-        const cy=(A.lat+B.lat+C.lat)/3;
+      // 3. Drape + triangular CALÇADAS
+      lg('info',`Drapejando ${calcadaFeats.length} calçadas...`);
+      const cFeats=[];
+      for(const feat of calcadaFeats)
+        drapeAndTriangulate(feat,tin.features,STEP_DEG,Delaunator,'Calçada',cFeats);
+      lg('ok',`Calçada: ${cFeats.length} triângulos`);
+
+      // 4. RUA = triângulos originais cujo centróide não está em
+      //    nenhuma quadra nem calçada (Z já correto, não precisa re-triangular)
+      lg('info','Classificando ruas por exclusão...');
+      const allUrban=[...quadraFeats,...calcadaFeats];
+      const rFeats=[];
+      for(const tri of tin.features){
+        const r=tri.geometry.coordinates[0];
+        const cx=(r[0][0]+r[1][0]+r[2][0])/3;
+        const cy=(r[0][1]+r[1][1]+r[2][1])/3;
         const pt=turf.point([cx,cy]);
-        let usage='Rua';
-        for(const qf of quadraFeats){
-          try{if(turf.booleanPointInPolygon(pt,qf)){usage='Quadra';break;}}catch(_){}
+        let hit=false;
+        for(const uf of allUrban){
+          try{if(turf.booleanPointInPolygon(pt,uf)){hit=true;break;}}catch(_){}
         }
-        if(usage==='Rua'){
-          for(const cf of calcadaFeats){
-            try{if(turf.booleanPointInPolygon(pt,cf)){usage='Calçada';break;}}catch(_){}
-          }
-        }
-        feat.properties.usage=usage;
-        if(usage==='Quadra') qFeats.push(feat);
-        else if(usage==='Calçada') cFeats.push(feat);
-        else rFeats.push(feat);
+        if(!hit) rFeats.push({...tri,properties:{...tri.properties,usage:'Rua'}});
       }
+      lg('ok',`Rua: ${rFeats.length} triângulos`);
+
       const result={
         Quadra:  {type:'FeatureCollection',features:qFeats},
         Calçada: {type:'FeatureCollection',features:cFeats},
         Rua:     {type:'FeatureCollection',features:rFeats},
       };
       const counts=Object.entries(result).map(([k,v])=>`${v.features.length} ${k}`).join(' · ');
-      lg('ok',`Triâng.: ${counts}`);
+      lg('ok',`Total: ${counts}`);
 
-      // ── 8. Publicar 3 camadas temporárias ────────────────────
+      // 5. Publicar 3 camadas temporárias
       try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
       for(const[cat,fc] of Object.entries(result)){
         const id=SPLIT_IDS[cat];
