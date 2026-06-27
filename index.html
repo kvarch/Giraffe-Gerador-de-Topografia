@@ -349,8 +349,55 @@ const CALCADA_LAYER = 'geoportal:calcada';
 const SPLIT_IDS    = {Quadra:'kv-split-quadra', Rua:'kv-split-rua'};
 const SPLIT_COLORS = {Quadra:'#c87137', Rua:'#3a3a3a'};
 
-// Interseção de dois segmentos [p1,p2] e [p3,p4] com pré-filtro bbox.
-// Retorna [x,y] ou null.
+// Distância de ponto (px,py) ao segmento (x1,y1)-(x2,y2)
+function ptToSegDist(px,py,x1,y1,x2,y2){
+  const dx=x2-x1,dy=y2-y1;
+  if(dx*dx+dy*dy<1e-20) return Math.hypot(px-x1,py-y1);
+  const t=Math.max(0,Math.min(1,((px-x1)*dx+(py-y1)*dy)/(dx*dx+dy*dy)));
+  return Math.hypot(px-x1-t*dx,py-y1-t*dy);
+}
+
+// Agrupa os SEGMENTOS das curvas de nível por cota.
+// Usar segmentos (não pontos amostrados) dá distâncias precisas.
+function contourSegsByElev(fcs){
+  const m=new Map();
+  for(const fc of fcs){
+    for(const f of(fc?.features||[])){
+      const elev=parseFloat(f.properties?.cd_numero_isovalor);
+      if(isNaN(elev)) continue;
+      const g=f.geometry;
+      const lines=g.type==='LineString'?[g.coordinates]
+        :g.type==='MultiLineString'?g.coordinates:[];
+      if(!m.has(elev)) m.set(elev,[]);
+      for(const ln of lines)
+        for(let i=0;i<ln.length-1;i++) m.get(elev).push([ln[i],ln[i+1]]);
+    }
+  }
+  return m;
+}
+
+// Interpola a elevação de (lng,lat) usando as duas cotas de curva mais
+// próximas (medida em distância mínima ao SEGMENTO, não ao ponto amostrado):
+//   Z = E1 + d1/(d1+d2) × (E2−E1)
+// Quando d1→0 (ponto quase sobre a curva E1) → Z→E1. Correto.
+function interpElevFromSegs(lng,lat,segsByElev){
+  const dists=[];
+  for(const[elev,segs] of segsByElev){
+    let minD=Infinity;
+    for(const[[x1,y1],[x2,y2]] of segs){
+      const d=ptToSegDist(lng,lat,x1,y1,x2,y2);
+      if(d<minD) minD=d;
+    }
+    dists.push([elev,minD]);
+  }
+  dists.sort((a,b)=>a[1]-b[1]);
+  if(!dists.length) return null;
+  if(dists.length===1) return dists[0][0];
+  const[e1,d1]=dists[0],[e2,d2]=dists[1];
+  return d1+d2<1e-14?e1:e1+d1/(d1+d2)*(e2-e1);
+}
+
+// Interseção de dois segmentos de linha com pré-filtro bbox
 function segIntersect(p1,p2,p3,p4){
   if(Math.max(p1[0],p2[0])<Math.min(p3[0],p4[0])||
      Math.min(p1[0],p2[0])>Math.max(p3[0],p4[0])||
@@ -364,41 +411,6 @@ function segIntersect(p1,p2,p3,p4){
   const u=((p3[0]-p1[0])*dy1-(p3[1]-p1[1])*dx1)/cross;
   if(t>=0&&t<=1&&u>=0&&u<=1) return[p1[0]+t*dx1,p1[1]+t*dy1];
   return null;
-}
-
-// Agrupa pontos de curva de nível por elevação (Map<elev, pts[]>).
-function groupPtsByElev(pts){
-  const m=new Map();
-  for(const p of pts){
-    if(!m.has(p.elev)) m.set(p.elev,[]);
-    m.get(p.elev).push(p);
-  }
-  return m;
-}
-
-// Interpola a elevação de um ponto (lng,lat) entre as duas cotas mais próximas.
-//
-//   E₁, d₁ = cota mais próxima e sua distância mínima até o ponto
-//   E₂, d₂ = segunda cota mais próxima
-//   Z = E₁ + d₁/(d₁+d₂) × (E₂−E₁)
-//
-// Garante que Z fica sempre entre as duas cotas vizinhas.
-// Quando d₁→0 (ponto quase na cota E₁), Z→E₁. Correto.
-function interpElevBetweenContours(lng,lat,byElev){
-  const dists=[];
-  for(const[elev,pts] of byElev){
-    let minD=Infinity;
-    for(const p of pts){
-      const d=Math.hypot(lng-p.lng,lat-p.lat);
-      if(d<minD) minD=d;
-    }
-    dists.push([elev,minD]);
-  }
-  dists.sort((a,b)=>a[1]-b[1]);
-  if(!dists.length) return null;
-  if(dists.length===1) return dists[0][0];
-  const[e1,d1]=dists[0],[e2,d2]=dists[1];
-  return(d1+d2<1e-14)?e1 : e1+d1/(d1+d2)*(e2-e1);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -772,10 +784,13 @@ function App(){
       lg('ok',`Quadras: ${quadraFeats.length} feições`);
       if(!quadraFeats.length) throw new Error('Sem dados de quadra — verifique o nome da camada');
 
-      // 2. Pontos base das curvas (todos, sem subsample)
-      const basePts=samplePoints(fcs);           // [{lng,lat,elev}]
-      const byElev=groupPtsByElev(basePts);       // Map<elev, pts[]>
-      lg('info',`${basePts.length} pts de curva | ${byElev.size} cotas distintas`);
+      // 2. Pontos base das curvas (para o TIN combinado)
+      const basePts=samplePoints(fcs);
+
+      // 2b. Segmentos de curva agrupados por cota (para interpolação precisa)
+      //     Usar segmentos garante distância real à linha, não ao ponto amostrado.
+      const segsByElev=contourSegsByElev(fcs);
+      lg('info',`${basePts.length} pts curva | ${segsByElev.size} cotas distintas`);
 
       // 3. Segmentos dos anéis externos das quadras
       const qSegs=[];
@@ -812,23 +827,30 @@ function App(){
       }
       lg('ok',`${ixPts.length} pontos de interseção curva×quadra`);
 
-      // 5. Vértices únicos dos limites de quadra com elevação interpolada.
-      //    Para cada vértice entre duas curvas:
-      //      Z = E₁ + d₁/(d₁+d₂) × (E₂−E₁)
-      //    onde d₁,d₂ são as distâncias às duas cotas mais próximas.
-      const SNAP_V=5e-6;
+      // 5. Densificar fronteira da quadra a cada ~10m e interpolar elevação.
+      //    Pontos densos → Delaunay cria arestas próximas da fronteira real.
+      //    Cada ponto recebe Z por: Z = E1 + d1/(d1+d2) × (E2−E1)
+      //    onde d1,d2 = distâncias mínimas às duas cotas de curva vizinhas.
+      const STEP_DEG=10/111320; // ~10m em graus (SP ~23°S)
+      const SNAP_V=1e-6;
       const seenV=new Map();
       const bndPts=[];
       for(const[q1,q2] of qSegs){
-        for(const[lng,lat] of[q1,q2]){
+        const dx=q2[0]-q1[0],dy=q2[1]-q1[1];
+        const segLen=Math.hypot(dx,dy);
+        const nSteps=Math.max(1,Math.ceil(segLen/STEP_DEG));
+        for(let s=0;s<=nSteps;s++){
+          const t=s/nSteps;
+          const lng=q1[0]+t*dx;
+          const lat=q1[1]+t*dy;
           const k=`${lng/SNAP_V|0},${lat/SNAP_V|0}`;
           if(seenV.has(k)) continue;
           seenV.set(k,true);
-          const elev=interpElevBetweenContours(lng,lat,byElev);
+          const elev=interpElevFromSegs(lng,lat,segsByElev);
           if(elev!==null) bndPts.push({lng,lat,elev});
         }
       }
-      lg('ok',`${bndPts.length} vértices de fronteira com Z interpolado`);
+      lg('ok',`${bndPts.length} pontos de fronteira com Z interpolado (passo ~10m)`);
 
       // 6. Combinar todos os pontos e clipar ao buffer
       const allPts=[...basePts,...ixPts,...bndPts];
