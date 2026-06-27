@@ -219,14 +219,6 @@ const LAYERS=[
 const PHASES=['idle','sel','r_scan','scan','r_gen','fetch','tin','r_patch','patch','done'];
 
 // ══════════════════════════════════════════════════════════════
-//  Camadas de uso do solo — classificação dos triângulos TIN
-//  ⚠ VERIFICAR nomes no catálogo GeoSampa (GetCapabilities)
-//  antes de publicar. Substituir se a camada tiver nome diferente.
-// ══════════════════════════════════════════════════════════════
-const QUADRA_LAYER  = 'geoportal:SIRGAS_SHP_QUADRA';   // polígonos de quadra
-const CALCADA_LAYER = 'geoportal:SIRGAS_SHP_CALCADA';  // polígonos de calçada
-
-// ══════════════════════════════════════════════════════════════
 //  Processar FeatureCollections das curvas
 // ══════════════════════════════════════════════════════════════
 
@@ -327,51 +319,156 @@ async function buildTIN(pts,datum){
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Classificação face-a-face: Quadra / Calçada / Rua
-//  Recebe o TIN já calculado e dois arrays de features GeoJSON
-//  (polígonos de quadras e calçadas). Retorna nova FeatureCollection
-//  idêntica geometricamente — apenas propriedades enriquecidas com
-//  usage:"Quadra"|"Calçada"|"Rua". Coordenadas Z preservadas.
+//  Layer IDs / nomes
 // ══════════════════════════════════════════════════════════════
-function classifyTIN(tinResult, quadraFeats, calcadaFeats){
-  const features=tinResult.features.map(f=>{
-    const ring=f.geometry.coordinates[0];
-    // Centróide 2D do triângulo (ignora Z — turf só precisa de lng/lat)
-    const cx=(ring[0][0]+ring[1][0]+ring[2][0])/3;
-    const cy=(ring[0][1]+ring[1][1]+ring[2][1])/3;
-    const pt=turf.point([cx,cy]);
-
-    let usage='Rua'; // padrão por exclusão
-
-    // 1ª prioridade: quadra
-    for(const qf of quadraFeats){
-      try{
-        if(turf.booleanPointInPolygon(pt,qf)){usage='Quadra';break;}
-      }catch(_){}
-    }
-
-    // 2ª prioridade: calçada (só testa se não for quadra)
-    if(usage==='Rua'){
-      for(const cf of calcadaFeats){
-        try{
-          if(turf.booleanPointInPolygon(pt,cf)){usage='Calçada';break;}
-        }catch(_){}
-      }
-    }
-
-    // Retorna feature com mesmo geometry (Z intacto) + usage injetado
-    return{
-      ...f,
-      properties:{...f.properties,usage},
-    };
-  });
-  return{...tinResult,features};
-}
-
-
 const PREVIEW_ID='kv-terrain-preview';
 const CURVAS_TEMP_ID='kv-curvas-3d';
 const CURVAS_PERM_NAME='Curvas de Nível · GeoSampa';
+
+// ══════════════════════════════════════════════════════════════
+//  Separação Geométrica por Uso do Solo
+//  ⚠ Verifique os nomes das camadas no GetCapabilities do WFS
+//    antes de publicar — substitua se necessário.
+// ══════════════════════════════════════════════════════════════
+const QUADRA_LAYER  = 'geoportal:quadra_viaria_editada'; // confirmado via GetCapabilities
+const CALCADA_LAYER = 'geoportal:calcada';               // confirmado via GetCapabilities
+
+const SPLIT_IDS    = {Quadra:'kv-split-quadra', Calçada:'kv-split-calcada', Rua:'kv-split-rua'};
+const SPLIT_COLORS = {Quadra:'#c87137', Calçada:'#7a8fa6', Rua:'#3a3a3a'};
+
+// ── Interpolação baricêntrica de Z em triângulo 3D ──────────────
+// Dado um ponto 2D [px,py] dentro do triângulo A-B-C (com Z),
+// retorna a altitude interpolada naquele ponto.
+function interpZ(A,B,C,px,py){
+  const[ax,ay,az=0]=A,[bx,by,bz=0]=B,[cx,cy,cz=0]=C;
+  const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
+  if(Math.abs(det)<1e-14) return(az+bz+cz)/3;
+  const w1=((by-cy)*(px-cx)+(cx-bx)*(py-cy))/det;
+  const w2=((cy-ay)*(px-cx)+(ax-cx)*(py-cy))/det;
+  return Math.max(0,w1*az+w2*bz+(1-w1-w2)*cz);
+}
+
+// ── Re-injeta Z em feature 2D usando triângulo pai como referência ─
+function injectZ(origTri,feat2D){
+  if(!feat2D?.geometry) return null;
+  const ring=origTri.geometry.coordinates[0]; // [[lng,lat,z],...]
+  const[A,B,C]=ring;
+  const addZ=r=>r.map(([px,py])=>[px,py,interpZ(A,B,C,px,py)]);
+  let geom3D;
+  if(feat2D.geometry.type==='Polygon')
+    geom3D={type:'Polygon',coordinates:feat2D.geometry.coordinates.map(addZ)};
+  else if(feat2D.geometry.type==='MultiPolygon')
+    geom3D={type:'MultiPolygon',coordinates:feat2D.geometry.coordinates.map(p=>p.map(addZ))};
+  else return null;
+  // avgH = média dos Z do anel exterior (para fill-extrusion-height)
+  const outer=geom3D.type==='Polygon'?geom3D.coordinates[0]:geom3D.coordinates[0][0];
+  const avgH=outer.reduce((s,v)=>s+v[2],0)/outer.length;
+  return{...feat2D,geometry:geom3D,properties:{...feat2D.properties,avgH}};
+}
+
+// ── Remove Z de uma feature para operações turf 2D ──────────────
+function strip3D(feat){
+  if(!feat?.geometry) return feat;
+  const strip=r=>r.map(([x,y])=>[x,y]);
+  const g=feat.geometry;
+  let coords;
+  if(g.type==='Polygon')      coords=g.coordinates.map(strip);
+  else if(g.type==='MultiPolygon') coords=g.coordinates.map(p=>p.map(strip));
+  else return feat;
+  return{...feat,geometry:{...g,coordinates:coords}};
+}
+
+// ── Achata Polygon/MultiPolygon → array de Polygon features ─────
+function flattenToPolygons(feat){
+  if(!feat?.geometry) return[];
+  if(feat.geometry.type==='Polygon') return[feat];
+  if(feat.geometry.type==='MultiPolygon')
+    return feat.geometry.coordinates.map(coords=>({
+      ...feat,geometry:{type:'Polygon',coordinates:coords}
+    }));
+  return[];
+}
+
+// ── União de um array de features em um único polígono ───────────
+// Itera par a par; ignora geometrias inválidas silenciosamente.
+function unionMany(features){
+  const polys=features.filter(f=>
+    f?.geometry&&['Polygon','MultiPolygon'].includes(f.geometry.type)
+  );
+  if(!polys.length) return null;
+  let result=polys[0];
+  for(let i=1;i<polys.length;i++){
+    try{result=turf.union(result,polys[i]);}catch(_){}
+  }
+  return result;
+}
+
+// ── Recorte geométrico do TIN em três categorias ─────────────────
+// Para cada triângulo:
+//   1. Intersecta com quadraUnion → fatia "Quadra"
+//   2. Intersecta o restante com calcadaUnion → fatia "Calçada"
+//   3. O que sobrou → fatia "Rua"
+// Cada fatia recebe Z interpolado via coordenadas baricêntricas do
+// triângulo original — relevo preservado sem distorção.
+function splitTINByLandUse(tinResult,quadraUnion,calcadaUnion){
+  const qBbox=quadraUnion?turf.bbox(quadraUnion):null;
+  const cBbox=calcadaUnion?turf.bbox(calcadaUnion):null;
+
+  function bboxOverlaps([ax,ay,bx,by],[cx,cy,dx,dy]){
+    return ax<=dx&&bx>=cx&&ay<=dy&&by>=cy;
+  }
+
+  const qFeats=[],cFeats=[],rFeats=[];
+
+  for(const tri of tinResult.features){
+    const tri2D=strip3D(tri);
+    const tBbox=turf.bbox(tri2D);
+    const props=tri.properties;
+
+    // ── Fatia Quadra ──────────────────────────────────────────
+    let afterQ=tri2D;  // resto a processar após extrair quadra
+    if(quadraUnion&&qBbox&&bboxOverlaps(tBbox,qBbox)){
+      try{
+        const qPart=turf.intersect(tri2D,quadraUnion);
+        if(qPart?.geometry){
+          const q3D=injectZ(tri,{...qPart,properties:{...props,usage:'Quadra'}});
+          if(q3D) flattenToPolygons(q3D).forEach(f=>qFeats.push(f));
+        }
+        const diff=turf.difference(tri2D,quadraUnion);
+        afterQ=(diff?.geometry)?diff:null;
+      }catch(_){ /* mantém afterQ=tri2D */ }
+    }
+
+    // ── Fatia Calçada (sobre o que sobrou de quadra) ──────────
+    let afterC=afterQ;
+    if(afterQ&&calcadaUnion&&cBbox){
+      const aBbox=turf.bbox(afterQ);
+      if(bboxOverlaps(aBbox,cBbox)){
+        try{
+          const cPart=turf.intersect(afterQ,calcadaUnion);
+          if(cPart?.geometry){
+            const c3D=injectZ(tri,{...cPart,properties:{...props,usage:'Calçada'}});
+            if(c3D) flattenToPolygons(c3D).forEach(f=>cFeats.push(f));
+          }
+          const diff=turf.difference(afterQ,calcadaUnion);
+          afterC=(diff?.geometry)?diff:null;
+        }catch(_){ /* mantém afterC=afterQ */ }
+      }
+    }
+
+    // ── Fatia Rua (exclusão) ───────────────────────────────────
+    if(afterC?.geometry){
+      const r3D=injectZ(tri,{...afterC,properties:{...props,usage:'Rua'}});
+      if(r3D) flattenToPolygons(r3D).forEach(f=>rFeats.push(f));
+    }
+  }
+
+  return{
+    Quadra:  {type:'FeatureCollection',features:qFeats},
+    Calçada: {type:'FeatureCollection',features:cFeats},
+    Rua:     {type:'FeatureCollection',features:rFeats},
+  };
+}
 
 // ══════════════════════════════════════════════════════════════
 //  App
@@ -389,6 +486,10 @@ function App(){
   const[pct,setPct]=useState(0);
   const[logs,setLogs]=useState([]);
   const logEl=useRef(null);
+  // Estado das camadas de uso do solo (split geométrico)
+  const[splitFcs,setSplitFcs]=useState(null);   // {Quadra:FC, Calçada:FC, Rua:FC}
+  const[splitVis,setSplitVis]=useState({Quadra:true,Calçada:true,Rua:true});
+  const[splitBusy,setSplitBusy]=useState(false);
 
   const sp=v=>{setProxy(v);_proxy=v;localStorage.setItem('geosampa_proxy',v);};
   const lg=(t,m)=>{
@@ -536,40 +637,12 @@ function App(){
       lg('info','Triangulando TIN (Delaunay)...');
       const tinResult=await buildTIN(pts,datum);
       if(!tinResult.features.length) throw new Error('Nenhum triângulo válido');
+      setTin(tinResult);
       lg('ok',`TIN: ${tinResult.features.length} triângulos | ha/hb/hc calculados por vértice`);
-      setPct(75);
-
-      // ── Buscar Quadras e Calçadas em paralelo para classificação ──────────
-      lg('info','Buscando quadras e calçadas para classificar a malha...');
-      const[quadraRes,calcadaRes]=await Promise.allSettled([
-        fetchWFS(QUADRA_LAYER, ...geo.bbox, 500, 30000),
-        fetchWFS(CALCADA_LAYER,...geo.bbox, 500, 30000),
-      ]);
-      const quadraFeats=quadraRes.status==='fulfilled'?(quadraRes.value?.features||[]):[];
-      const calcadaFeats=calcadaRes.status==='fulfilled'?(calcadaRes.value?.features||[]):[];
-      if(quadraRes.status==='rejected')
-        lg('warn',`Quadras: ${quadraRes.reason?.message?.slice(0,60)||'erro'}`);
-      if(calcadaRes.status==='rejected')
-        lg('warn',`Calçadas: ${calcadaRes.reason?.message?.slice(0,60)||'erro'}`);
-      lg('ok',`Quadras: ${quadraFeats.length} feat. | Calçadas: ${calcadaFeats.length} feat.`);
-      if(!quadraFeats.length&&!calcadaFeats.length)
-        lg('warn','⚠ Sem dados de quadras/calçadas — todos os triângulos → "Rua"');
-      setPct(85);
-
-      // ── Classificar face a face ───────────────────────────────────────────
-      lg('info','Classificando triângulos (Quadra / Calçada / Rua)...');
-      const classifiedTin=classifyTIN(tinResult,quadraFeats,calcadaFeats);
-      const uc=classifiedTin.features.reduce((a,f)=>{
-        const u=f.properties.usage;a[u]=(a[u]||0)+1;return a;
-      },{});
-      lg('ok',`Classificação: ${uc['Quadra']||0} Quadra · ${uc['Calçada']||0} Calçada · ${uc['Rua']||0} Rua`);
-      setPct(90);
-
-      setTin(classifiedTin);
-      // Preview com cores por uso do solo
-      await _renderPreview(classifiedTin,eMax-eMin);
+      // Preview com exageração
+      await _renderPreview(tinResult,eMax-eMin);
       setPct(100);
-      setStats({eMin,eMax,dnivel:eMax-eMin,datum,ntri:classifiedTin.features.length,npts:pts.length});
+      setStats({eMin,eMax,dnivel:eMax-eMin,datum,ntri:tinResult.features.length,npts:pts.length});
       lg('ok','Preview visível. Use os botões abaixo para exportar ou fixar patches.');
       setPhase('r_patch');
     }catch(e){
@@ -578,19 +651,17 @@ function App(){
     }
   };
 
-  // Preview fill-extrusion colorido por uso do solo
+  // Preview fill-extrusion com alturas reais (sem exageração)
   const _renderPreview=async(tinResult,dnivel)=>{
-    // Cor por categoria de uso do solo; fallback verde para triângulos sem usage
-    const cColor=['match',['coalesce',['get','usage'],''],
-      'Quadra',  '#c87137',   // laranja — lote
-      'Calçada', '#7a8fa6',   // azul-cinza — passeio
-      /* Rua */  '#2a2a2a'    // cinza escuro — via
-    ];
+    const maxH=dnivel||1;
+    const cex=['interpolate',['linear'],['get','avgH'],
+      0,'#1a3a28',maxH*.15,'#1d6347',maxH*.35,'#25a265',
+      maxH*.55,'#6ec97e',maxH*.75,'#c8e6a0',maxH,'#f0ede2'];
     try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
     await rpc.invoke('addTempLayerGeoJSON',[
       PREVIEW_ID,tinResult,
       {type:'fill-extrusion',paint:{
-        'fill-extrusion-color':cColor,
+        'fill-extrusion-color':cex,
         'fill-extrusion-height':['get','avgH'],
         'fill-extrusion-base':0,'fill-extrusion-opacity':0.9,
       }}
@@ -691,7 +762,7 @@ function App(){
       const plainFeats=valid.map(f=>({
         type:'Feature',
         geometry:f.geometry,        // 3D: [lng,lat,height] por vértice
-        properties:{stackOrder:0,layerId:'default',usage:f.properties?.usage||'Rua'}
+        properties:{stackOrder:0,layerId:'default'}
       }));
       lg('info',`Passo 1: importRawSections (${valid.length} polígonos, sem patch)...`);
       setPct(10);
@@ -730,7 +801,6 @@ function App(){
             id:impFeat.properties?.id,
             patch,
             patchType:'slab',
-            usage:valid[i].properties?.usage||'Rua',
           }
         };
       });
@@ -756,11 +826,98 @@ function App(){
     }
   };
 
+  // ─── Separar por Uso do Solo ─────────────────────────────────
+  // Busca quadras e calçadas do GeoSampa, constrói uniões e recorta
+  // o TIN geometricamente, publicando 3 camadas temp no Giraffe.
+  const doSplit=async()=>{
+    if(!tin||busy||splitBusy) return;
+    setSplitBusy(true);
+    lg('info','━━ Separando terreno por uso do solo ━━');
+    try{
+      // 1. Buscar as duas camadas em paralelo
+      lg('info',`Buscando camadas GeoSampa: ${QUADRA_LAYER.split(':')[1]} e ${CALCADA_LAYER.split(':')[1]}...`);
+      const[quadraRes,calcadaRes]=await Promise.allSettled([
+        fetchWFS(QUADRA_LAYER,...geo.bbox,500,30000),
+        fetchWFS(CALCADA_LAYER,...geo.bbox,500,30000),
+      ]);
+      const quadraFeats=quadraRes.status==='fulfilled'?(quadraRes.value?.features||[]):[];
+      const calcadaFeats=calcadaRes.status==='fulfilled'?(calcadaRes.value?.features||[]):[];
+      if(quadraRes.status==='rejected')  lg('warn',`Quadras: ${(quadraRes.reason?.message||'erro').slice(0,60)}`);
+      if(calcadaRes.status==='rejected') lg('warn',`Calçadas: ${(calcadaRes.reason?.message||'erro').slice(0,60)}`);
+      lg('ok',`Quadras: ${quadraFeats.length} feat. · Calçadas: ${calcadaFeats.length} feat.`);
+      if(!quadraFeats.length&&!calcadaFeats.length)
+        lg('warn','⚠ Sem dados de quadra/calçada — todo o terreno ficará como "Rua"');
+
+      // 2. Construir uniões (dissolve) de cada camada
+      lg('info','Construindo uniões das camadas...');
+      const quadraUnion=unionMany(quadraFeats);
+      const calcadaUnion=unionMany(calcadaFeats);
+
+      // 3. Recorte geométrico com interpolação Z
+      lg('info',`Recortando ${tin.features.length} triângulos — aguarde...`);
+      const result=splitTINByLandUse(tin,quadraUnion,calcadaUnion);
+      const counts=Object.entries(result).map(([k,v])=>`${v.features.length} ${k}`).join(' · ');
+      lg('ok',`Split: ${counts}`);
+
+      // 4. Publicar 3 camadas temporárias (remove preview combinado)
+      try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
+      for(const[cat,fc] of Object.entries(result)){
+        const id=SPLIT_IDS[cat];
+        try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
+        if(fc.features.length){
+          await rpc.invoke('addTempLayerGeoJSON',[id,JSON.parse(JSON.stringify(fc)),{
+            type:'fill-extrusion',
+            paint:{
+              'fill-extrusion-color':SPLIT_COLORS[cat],
+              'fill-extrusion-height':['get','avgH'],
+              'fill-extrusion-base':0,'fill-extrusion-opacity':0.92,
+            }
+          }]);
+        }
+      }
+      setSplitFcs(result);
+      setSplitVis({Quadra:true,Calçada:true,Rua:true});
+      lg('ok','✓ 3 camadas publicadas. Clique nos botões para ocultar/mostrar cada uso.');
+    }catch(e){
+      lg('err',`Separação: ${e.message}`);
+    }finally{
+      setSplitBusy(false);
+    }
+  };
+
+  // ─── Ocultar / mostrar camada de uso do solo ─────────────────
+  const toggleSplitLayer=async(cat)=>{
+    if(!splitFcs) return;
+    const newVis={...splitVis,[cat]:!splitVis[cat]};
+    setSplitVis(newVis);
+    const id=SPLIT_IDS[cat];
+    if(!newVis[cat]){
+      try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
+    } else {
+      const fc=splitFcs[cat];
+      if(fc?.features?.length){
+        try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
+        await rpc.invoke('addTempLayerGeoJSON',[id,JSON.parse(JSON.stringify(fc)),{
+          type:'fill-extrusion',
+          paint:{
+            'fill-extrusion-color':SPLIT_COLORS[cat],
+            'fill-extrusion-height':['get','avgH'],
+            'fill-extrusion-base':0,'fill-extrusion-opacity':0.92,
+          }
+        }]);
+      }
+    }
+  };
+
   // ─── Limpar ─────────────────────────────────────────────────
   const doClear=async()=>{
     try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
     try{await rpc.invoke('removeTempLayer',[CURVAS_TEMP_ID]);}catch(_){}
+    for(const id of Object.values(SPLIT_IDS)){
+      try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
+    }
     setGeo(null);setScan({});setFcs(null);setTin(null);
+    setSplitFcs(null);setSplitVis({Quadra:true,Calçada:true,Rua:true});setSplitBusy(false);
     setPhase('idle');setPct(0);setStats(null);setLogs([]);
   };
 
@@ -877,6 +1034,42 @@ function App(){
         h('span',{className:'rk'},'Datum (zero)'),  h('span',{className:'rv'},`${stats.datum} m s.n.m.`),
         h('span',{className:'rk'},'Triâng. TIN'),   h('span',{className:'rv'},stats.ntri.toLocaleString('pt-BR')),
         h('span',{className:'rk'},'Pts controle'),  h('span',{className:'rv'},stats.npts.toLocaleString('pt-BR')),
+      ),
+
+      // ── Separar por Uso do Solo ───────────────────────────────
+      hasTin&&h('div',{style:{flexShrink:0}},
+        h('div',{className:'divl'}),
+        h('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'5px'}},
+          h('span',{style:{fontSize:'10px',color:'#555',fontWeight:600,letterSpacing:'.4px'}},'Uso do Solo 3D'),
+          h('button',{
+            className:'btn btn-out',
+            style:{fontSize:'10px',padding:'3px 9px'},
+            onClick:doSplit,
+            disabled:!hasTin||busy||splitBusy,
+          },splitBusy?'⏳ Recortando...':'✂ Separar')
+        ),
+        splitFcs&&h('div',{style:{display:'flex',gap:'3px'}},
+          ...['Quadra','Calçada','Rua'].map(cat=>
+            h('button',{
+              key:cat,
+              onClick:()=>toggleSplitLayer(cat),
+              style:{
+                flex:1,padding:'5px 3px',borderRadius:'3px',
+                fontSize:'10px',fontWeight:600,cursor:'pointer',
+                border:'1px solid',fontFamily:'Hind,sans-serif',transition:'all .15s',
+                background:splitVis[cat]?SPLIT_COLORS[cat]+'22':'transparent',
+                color:splitVis[cat]?SPLIT_COLORS[cat]:'#252525',
+                borderColor:splitVis[cat]?SPLIT_COLORS[cat]:'#141414',
+              }
+            },
+              h('div',{style:{fontSize:'9px',marginBottom:'1px',opacity:.7}},splitVis[cat]?'●':'○'),
+              cat,
+              h('div',{style:{fontSize:'9px',opacity:.55,marginTop:'1px'}},
+                `${(splitFcs[cat]?.features?.length||0).toLocaleString('pt-BR')} feições`
+              )
+            )
+          )
+        )
       ),
 
       // Log
