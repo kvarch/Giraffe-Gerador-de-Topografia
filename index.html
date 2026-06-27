@@ -342,47 +342,31 @@ const CALCADA_LAYER = 'geoportal:calcada';               // confirmado via GetCa
 const SPLIT_IDS    = {Quadra:'kv-split-quadra', Calçada:'kv-split-calcada', Rua:'kv-split-rua'};
 const SPLIT_COLORS = {Quadra:'#c87137', Calçada:'#7a8fa6', Rua:'#3a3a3a'};
 
-// ── Equação do Plano ──────────────────────────────────────────────
-// Dado ponto 2D (lng, lat) e os 3 vértices do triângulo do TIN,
-// retorna o Z relativo exato usando a Equação do Plano.
+// ── Z por interpolação de plano — implementação numericamente estável ─
+// Para coordenadas mistas (X,Y em graus ~1e-4, Z em metros ~1–50),
+// a equação do plano via produto vetorial 3D produz valores completamente
+// errados (C = v1x·v2y ≈ 1e-8 enquanto A·lng ≈ 5e-4 → Z ≈ 50.000 m).
 //
-// Passo 1: teste baricêntrico 2D para confirmar que o ponto está
-//          dentro deste triângulo (base perfeitamente plana, como
-//          descrito pelo Giraffe — alturas controladas independentemente).
-// Passo 2: normal do plano N = v1 × v2, onde v1=P2-P1, v2=P3-P1.
-//          Z = -(A·X + B·Y + D) / C, onde D = -(A·P1x + B·P1y + C·P1z)
-//
-// Nota: X,Y em graus, Z em metros — o teste baricêntrico usa apenas
-// a projeção 2D (estável); a eq. do plano opera nos 3 eixos corretos.
+// A interpolação baricêntrica é matematicamente EQUIVALENTE à equação do
+// plano mas opera separadamente:
+//   • teste 2D em graus (determinante estável)
+//   • Z como combinação linear dos Z dos 3 vértices (sem produto vetorial)
+// Isso dá o Z correto para qualquer ponto dentro do triângulo.
 function getZAtPoint(lng,lat,tinFeatures){
   for(const tri of tinFeatures){
     const ring=tri.geometry.coordinates[0];
-    // Vértices: [lng, lat, z_relativo]
     const[ax,ay,az=0]=ring[0],[bx,by,bz=0]=ring[1],[cx,cy,cz=0]=ring[2];
-
-    // Teste baricêntrico 2D — localiza triângulo na projeção plana
+    // Passo 1: localizar triângulo — projeção 2D plana (graus)
     const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
     if(Math.abs(det)<1e-14) continue;
     const w1=((by-cy)*(lng-cx)+(cx-bx)*(lat-cy))/det;
     const w2=((cy-ay)*(lng-cx)+(ax-cx)*(lat-cy))/det;
     const w3=1-w1-w2;
     if(w1<-1e-3||w2<-1e-3||w3<-1e-3) continue;
-
-    // Vetores do triângulo em 3D (v1=P2-P1, v2=P3-P1)
-    const v1x=bx-ax,v1y=by-ay,v1z=bz-az;
-    const v2x=cx-ax,v2y=cy-ay,v2z=cz-az;
-    // Normal = v1 × v2  →  (A, B, C)
-    const A=v1y*v2z-v1z*v2y;
-    const B=v1z*v2x-v1x*v2z;
-    const C=v1x*v2y-v1y*v2x;
-    // Equação do plano: A·X + B·Y + C·Z + D = 0
-    const D=-(A*ax+B*ay+C*az);
-    // Resolver para Z: Z = -(A·X + B·Y + D) / C
-    // Se C ≈ 0 (plano vertical ou degenerado), usa fallback baricêntrico
-    if(Math.abs(C)<1e-12) return Math.max(0,w1*az+w2*bz+w3*cz);
-    return Math.max(0,-(A*lng+B*lat+D)/C);
+    // Passo 2: Z = w1·Z1 + w2·Z2 + w3·Z3  (eq. do plano, estável)
+    return Math.max(0,w1*az+w2*bz+w3*cz);
   }
-  return null; // ponto fora de todos os triângulos do TIN
+  return null; // ponto fora do TIN
 }
 
 // ── Adensamento de anel ───────────────────────────────────────────
