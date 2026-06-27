@@ -219,6 +219,14 @@ const LAYERS=[
 const PHASES=['idle','sel','r_scan','scan','r_gen','fetch','tin','r_patch','patch','done'];
 
 // ══════════════════════════════════════════════════════════════
+//  Camadas de uso do solo — classificação dos triângulos TIN
+//  ⚠ VERIFICAR nomes no catálogo GeoSampa (GetCapabilities)
+//  antes de publicar. Substituir se a camada tiver nome diferente.
+// ══════════════════════════════════════════════════════════════
+const QUADRA_LAYER  = 'geoportal:SIRGAS_SHP_QUADRA';   // polígonos de quadra
+const CALCADA_LAYER = 'geoportal:SIRGAS_SHP_CALCADA';  // polígonos de calçada
+
+// ══════════════════════════════════════════════════════════════
 //  Processar FeatureCollections das curvas
 // ══════════════════════════════════════════════════════════════
 
@@ -319,8 +327,48 @@ async function buildTIN(pts,datum){
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Layer IDs / nomes
+//  Classificação face-a-face: Quadra / Calçada / Rua
+//  Recebe o TIN já calculado e dois arrays de features GeoJSON
+//  (polígonos de quadras e calçadas). Retorna nova FeatureCollection
+//  idêntica geometricamente — apenas propriedades enriquecidas com
+//  usage:"Quadra"|"Calçada"|"Rua". Coordenadas Z preservadas.
 // ══════════════════════════════════════════════════════════════
+function classifyTIN(tinResult, quadraFeats, calcadaFeats){
+  const features=tinResult.features.map(f=>{
+    const ring=f.geometry.coordinates[0];
+    // Centróide 2D do triângulo (ignora Z — turf só precisa de lng/lat)
+    const cx=(ring[0][0]+ring[1][0]+ring[2][0])/3;
+    const cy=(ring[0][1]+ring[1][1]+ring[2][1])/3;
+    const pt=turf.point([cx,cy]);
+
+    let usage='Rua'; // padrão por exclusão
+
+    // 1ª prioridade: quadra
+    for(const qf of quadraFeats){
+      try{
+        if(turf.booleanPointInPolygon(pt,qf)){usage='Quadra';break;}
+      }catch(_){}
+    }
+
+    // 2ª prioridade: calçada (só testa se não for quadra)
+    if(usage==='Rua'){
+      for(const cf of calcadaFeats){
+        try{
+          if(turf.booleanPointInPolygon(pt,cf)){usage='Calçada';break;}
+        }catch(_){}
+      }
+    }
+
+    // Retorna feature com mesmo geometry (Z intacto) + usage injetado
+    return{
+      ...f,
+      properties:{...f.properties,usage},
+    };
+  });
+  return{...tinResult,features};
+}
+
+
 const PREVIEW_ID='kv-terrain-preview';
 const CURVAS_TEMP_ID='kv-curvas-3d';
 const CURVAS_PERM_NAME='Curvas de Nível · GeoSampa';
@@ -488,12 +536,40 @@ function App(){
       lg('info','Triangulando TIN (Delaunay)...');
       const tinResult=await buildTIN(pts,datum);
       if(!tinResult.features.length) throw new Error('Nenhum triângulo válido');
-      setTin(tinResult);
       lg('ok',`TIN: ${tinResult.features.length} triângulos | ha/hb/hc calculados por vértice`);
-      // Preview com exageração
-      await _renderPreview(tinResult,eMax-eMin);
+      setPct(75);
+
+      // ── Buscar Quadras e Calçadas em paralelo para classificação ──────────
+      lg('info','Buscando quadras e calçadas para classificar a malha...');
+      const[quadraRes,calcadaRes]=await Promise.allSettled([
+        fetchWFS(QUADRA_LAYER, ...geo.bbox, 500, 30000),
+        fetchWFS(CALCADA_LAYER,...geo.bbox, 500, 30000),
+      ]);
+      const quadraFeats=quadraRes.status==='fulfilled'?(quadraRes.value?.features||[]):[];
+      const calcadaFeats=calcadaRes.status==='fulfilled'?(calcadaRes.value?.features||[]):[];
+      if(quadraRes.status==='rejected')
+        lg('warn',`Quadras: ${quadraRes.reason?.message?.slice(0,60)||'erro'}`);
+      if(calcadaRes.status==='rejected')
+        lg('warn',`Calçadas: ${calcadaRes.reason?.message?.slice(0,60)||'erro'}`);
+      lg('ok',`Quadras: ${quadraFeats.length} feat. | Calçadas: ${calcadaFeats.length} feat.`);
+      if(!quadraFeats.length&&!calcadaFeats.length)
+        lg('warn','⚠ Sem dados de quadras/calçadas — todos os triângulos → "Rua"');
+      setPct(85);
+
+      // ── Classificar face a face ───────────────────────────────────────────
+      lg('info','Classificando triângulos (Quadra / Calçada / Rua)...');
+      const classifiedTin=classifyTIN(tinResult,quadraFeats,calcadaFeats);
+      const uc=classifiedTin.features.reduce((a,f)=>{
+        const u=f.properties.usage;a[u]=(a[u]||0)+1;return a;
+      },{});
+      lg('ok',`Classificação: ${uc['Quadra']||0} Quadra · ${uc['Calçada']||0} Calçada · ${uc['Rua']||0} Rua`);
+      setPct(90);
+
+      setTin(classifiedTin);
+      // Preview com cores por uso do solo
+      await _renderPreview(classifiedTin,eMax-eMin);
       setPct(100);
-      setStats({eMin,eMax,dnivel:eMax-eMin,datum,ntri:tinResult.features.length,npts:pts.length});
+      setStats({eMin,eMax,dnivel:eMax-eMin,datum,ntri:classifiedTin.features.length,npts:pts.length});
       lg('ok','Preview visível. Use os botões abaixo para exportar ou fixar patches.');
       setPhase('r_patch');
     }catch(e){
@@ -502,17 +578,19 @@ function App(){
     }
   };
 
-  // Preview fill-extrusion com alturas reais (sem exageração)
+  // Preview fill-extrusion colorido por uso do solo
   const _renderPreview=async(tinResult,dnivel)=>{
-    const maxH=dnivel||1;
-    const cex=['interpolate',['linear'],['get','avgH'],
-      0,'#1a3a28',maxH*.15,'#1d6347',maxH*.35,'#25a265',
-      maxH*.55,'#6ec97e',maxH*.75,'#c8e6a0',maxH,'#f0ede2'];
+    // Cor por categoria de uso do solo; fallback verde para triângulos sem usage
+    const cColor=['match',['coalesce',['get','usage'],''],
+      'Quadra',  '#c87137',   // laranja — lote
+      'Calçada', '#7a8fa6',   // azul-cinza — passeio
+      /* Rua */  '#2a2a2a'    // cinza escuro — via
+    ];
     try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
     await rpc.invoke('addTempLayerGeoJSON',[
       PREVIEW_ID,tinResult,
       {type:'fill-extrusion',paint:{
-        'fill-extrusion-color':cex,
+        'fill-extrusion-color':cColor,
         'fill-extrusion-height':['get','avgH'],
         'fill-extrusion-base':0,'fill-extrusion-opacity':0.9,
       }}
@@ -613,7 +691,7 @@ function App(){
       const plainFeats=valid.map(f=>({
         type:'Feature',
         geometry:f.geometry,        // 3D: [lng,lat,height] por vértice
-        properties:{stackOrder:0,layerId:'default'}
+        properties:{stackOrder:0,layerId:'default',usage:f.properties?.usage||'Rua'}
       }));
       lg('info',`Passo 1: importRawSections (${valid.length} polígonos, sem patch)...`);
       setPct(10);
@@ -652,6 +730,7 @@ function App(){
             id:impFeat.properties?.id,
             patch,
             patchType:'slab',
+            usage:valid[i].properties?.usage||'Rua',
           }
         };
       });
@@ -702,7 +781,7 @@ function App(){
       h('div',null,
         h('p',{style:{fontSize:'9px',letterSpacing:'2px',color:'#252525',textTransform:'uppercase'}},'KV Arquitetos'),
         h('h1',{style:{fontSize:'13px',fontWeight:700,color:'#00ACCD'}},'Perfil de Terreno 3D'),
-        h('p',{style:{fontSize:'9px',color:'#2a2a2a',marginTop:'1px',letterSpacing:'.5px'}},'beta V28')
+        h('p',{style:{fontSize:'9px',color:'#2a2a2a',marginTop:'1px',letterSpacing:'.5px'}},'beta V29')
       ),
       hasGeo&&h('button',{className:'btn btn-sm',onClick:doClear,disabled:busy},'✕ limpar')
     ),
