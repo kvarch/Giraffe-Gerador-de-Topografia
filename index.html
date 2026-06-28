@@ -346,11 +346,12 @@ const SPLIT_IDS    = {Quadra:'kv-split-quadra', Calçada:'kv-split-calcada', Rua
 const SPLIT_COLORS = {Quadra:'#c87137', Calçada:'#7a8fa6', Rua:'#3a3a3a'};
 
 // ── Interpolação Z baricêntrica do TIN ────────────────────────
-// Para um vértice (lng,lat) de um polígono urbano 2D, localiza o
-// triângulo do TIN que o contém e retorna sua altura relativa Z.
-// Usa coordenadas em graus para o teste 2D (estável, sem conversão
-// de escala), e pesos baricêntricos para interpolar Z (em metros).
+// Localiza o triângulo do TIN que contém (lng,lat) em 2D e retorna
+// a altura relativa Z interpolada pelos pesos baricêntricos.
+// Fallback: quando o ponto está fora da cobertura do TIN (ex.: vértices
+// do buffer perimetral), usa o vértice TIN mais próximo → evita Z=0.
 function getZFromTIN(lng,lat,tinFeatures){
+  // Tentativa 1: interpolação baricêntrica exata
   for(const tri of tinFeatures){
     const ring=tri.geometry.coordinates[0];
     const[ax,ay,az=0]=ring[0],[bx,by,bz=0]=ring[1],[cx,cy,cz=0]=ring[2];
@@ -362,7 +363,16 @@ function getZFromTIN(lng,lat,tinFeatures){
     if(w1>=-1e-3&&w2>=-1e-3&&w3>=-1e-3)
       return Math.max(0,w1*az+w2*bz+w3*cz);
   }
-  return null;
+  // Fallback: vértice TIN mais próximo (pontos no perímetro do buffer
+  // podem cair fora dos triângulos — sem isso ficam com Z=0)
+  let bestZ=0,bestD=Infinity;
+  for(const tri of tinFeatures){
+    for(const v of tri.geometry.coordinates[0].slice(0,3)){
+      const d=Math.hypot(lng-v[0],lat-v[1]);
+      if(d<bestD){bestD=d;bestZ=v[2]||0;}
+    }
+  }
+  return bestZ;
 }
 
 // ── Adensamento de anel ───────────────────────────────────────
@@ -717,13 +727,13 @@ function App(){
     }
   };
 
-  // ─── Fixar patches (multi-categoria se split disponível) ───────
+  // ─── Fixar patches (cria layer separada por categoria) ─────────
   const doFixar=async()=>{
     if(!tin||phase!=='r_patch'||busy) return;
     setPhase('patch');setPct(0);
     const cats=splitFcs?Object.entries(splitFcs):[['Terreno',tin]];
     const nCats=cats.length;
-    lg('info',`━━ Patches 3D — ${nCats===1?'terreno unificado':`${nCats} categorias`} ━━`);
+    lg('info',`━━ Patches 3D — ${nCats===1?'terreno unificado':`${nCats} layers separadas`} ━━`);
     try{
       let total=0;
       for(let ci=0;ci<nCats;ci++){
@@ -740,13 +750,32 @@ function App(){
         if(!valid.length){lg('warn',`${cat}: sem triângulos — pulando.`);continue;}
         const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
         lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
-        setPct(pp(.05));
-        const plain=valid.map(f=>({type:'Feature',geometry:f.geometry,
-          properties:{stackOrder:0,layerId:'default',usage:cat}}));
+        setPct(pp(.03));
+
+        // Criar drawing layer dedicada para esta categoria
+        let layerId='default';
+        try{
+          const dl=await rpc.invoke('createDrawingLayer',[`Terreno · ${cat}`]);
+          if(dl?.id){
+            layerId=dl.id;
+            await rpc.invoke('activateDrawingLayer',[layerId]);
+            lg('ok',`${cat}: layer criada (${layerId.slice(0,10)}...)`);
+          }
+        }catch(e){
+          lg('warn',`${cat}: layer separada falhou (${e.message?.slice(0,40)}) — usando default`);
+        }
+        setPct(pp(.10));
+
+        const plain=valid.map(f=>({
+          type:'Feature',geometry:f.geometry,
+          properties:{stackOrder:0,layerId,usage:cat}
+        }));
         const imported=await rpc.invoke('importRawSections',[plain]);
         if(!Array.isArray(imported)||!imported.length)
           throw new Error(`${cat}: importRawSections sem retorno`);
-        lg('ok',`${cat}: ${imported.length} seções`);setPct(pp(.50));
+        lg('ok',`${cat}: ${imported.length} seções na layer "${layerId.slice(0,10)}..."`);
+        setPct(pp(.50));
+
         const updates=imported.map((imp,i)=>{
           const orig=valid[i].geometry.coordinates[0];
           const impR=imp.geometry?.coordinates?.[0];
@@ -765,17 +794,17 @@ function App(){
         });
         const hasId=updates.filter(u=>u.properties.id).length;
         if(hasId<updates.length) lg('warn',`${cat}: ${updates.length-hasId} sem ID`);
-        setPct(pp(.70));
+        setPct(pp(.75));
         const vu=updates.filter(u=>u.properties.id);
         await rpc.invoke('updateRawSections',[vu]);
-        total+=vu.length;setPct(pp(.95));
-        lg('ok',`${cat}: ✓ ${vu.length} patches`);
+        total+=vu.length;setPct(pp(.97));
+        lg('ok',`${cat}: ✓ ${vu.length} patches aplicados`);
       }
       try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
       for(const id of Object.values(SPLIT_IDS)){
         try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
       }
-      setPct(100);lg('ok',`✓ ${total} patches — ${nCats} categoria(s)!`);
+      setPct(100);lg('ok',`✓ ${total} patches — ${nCats} layer(s) criada(s)!`);
       setPhase('done');
     }catch(e){lg('err',`Erro: ${e.message}`);setPhase('r_patch');setPct(0);}
   };
