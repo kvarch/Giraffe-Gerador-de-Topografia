@@ -417,9 +417,16 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
   for(const polyCoords of polys){
     if(!polyCoords.length||!polyCoords[0]||polyCoords[0].length<4) continue;
 
-    // Interpolação ESTRITA — retorna null se fora do TIN (sem fallback)
-    // Usada para os vértices do polígono: descarta se fora da cobertura
-    const strictZ=(lng,lat)=>{
+    // safeZ: interpolação baricêntrica do TIN + fallback de vizinho próximo.
+    // Diferença de strictZ: em vez de retornar null para pontos fora de qualquer
+    // triângulo TIN, usa o vértice TIN mais próximo SE ele estiver dentro de
+    // ~55m (6e-4 graus). Isso cobre as lacunas do TIN em áreas planas onde o
+    // maxEdge filter removeu triângulos longos entre curvas de nível esparsas.
+    // Pontos genuinamente externos (>55m de qualquer vértice TIN) continuam
+    // retornando null e sendo descartados — proteção contra triângulos voando.
+    const MAX_GAP=6e-4; // ~67m em graus
+    const safeZ=(lng,lat)=>{
+      // Tentativa 1: interpolação baricêntrica exata dentro de um triângulo
       for(const tri of tinFeatures){
         const r=tri.geometry.coordinates[0];
         const[ax,ay,az=0]=r[0],[bx,by,bz=0]=r[1],[cx,cy,cz=0]=r[2];
@@ -431,7 +438,17 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
         if(w1>=-1e-3&&w2>=-1e-3&&w3>=-1e-3)
           return Math.max(0,w1*az+w2*bz+w3*cz);
       }
-      return null; // fora do TIN — NÃO usar fallback aqui
+      // Tentativa 2: vértice TIN mais próximo (lacunas em áreas planas)
+      // Só usa se o vértice estiver dentro do limiar — protege contra Z errado
+      // em pontos muito afastados do TIN (perímetro do buffer em áreas inclinadas)
+      let bestZ=null,bestD=Infinity;
+      for(const tri of tinFeatures){
+        for(const v of tri.geometry.coordinates[0].slice(0,3)){
+          const d=Math.hypot(lng-v[0],lat-v[1]);
+          if(d<bestD){bestD=d;bestZ=v[2]||0;}
+        }
+      }
+      return bestD<=MAX_GAP?bestZ:null;
     };
 
     const SNAP=5e-7;
@@ -448,18 +465,16 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
     const poly2D={type:'Feature',geometry:{type:'Polygon',
       coordinates:polyCoords.map(r=>r.map(p=>[p[0],p[1]]))}};
 
-    // A) Anel externo adensado — apenas se strictZ não for null
+    // A) Anel externo adensado — descarta apenas se safeZ retornar null
     for(const[lng,lat] of densifyRing(polyCoords[0],stepDeg).slice(0,-1)){
-      const z=strictZ(lng,lat);
+      const z=safeZ(lng,lat);
       if(z!==null) addPt(lng,lat,z);
     }
 
-    // A) Anéis internos (buracos) — TAMBÉM adensados, mesmo passo do anel externo
-    //    Sem densificação, arestas longas da fronteira calçada/quadra na Rua ficam
-    //    com apenas 2 pontos → triângulos enormes nessa região.
+    // A) Anéis internos (buracos) — TAMBÉM adensados com safeZ
     for(let ri=1;ri<polyCoords.length;ri++)
       for(const[lng,lat] of densifyRing(polyCoords[ri],stepDeg).slice(0,-1)){
-        const z=strictZ(lng,lat);
+        const z=safeZ(lng,lat);
         if(z!==null) addPt(lng,lat,z);
       }
 
@@ -1017,7 +1032,7 @@ function App(){
       h('div',null,
         h('p',{style:{fontSize:'9px',letterSpacing:'2px',color:'#252525',textTransform:'uppercase'}},'KV Arquitetos'),
         h('h1',{style:{fontSize:'13px',fontWeight:700,color:'#00ACCD'}},'Perfil de Terreno 3D'),
-        h('p',{style:{fontSize:'9px',color:'#2a2a2a',marginTop:'1px',letterSpacing:'.5px'}},'beta V29')
+        h('p',{style:{fontSize:'9px',color:'#2a2a2a',marginTop:'1px',letterSpacing:'.5px'}},'beta V30')
       ),
       hasGeo&&h('button',{className:'btn btn-sm',onClick:doClear,disabled:busy},'✕ limpar')
     ),
