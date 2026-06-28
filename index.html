@@ -461,12 +461,13 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
         if(z!==null) addPt(lng,lat,z);
       }
 
-    // B) Pontos de curvas de nível — já pré-classificados para esta categoria
-    //    Não precisam de filtro poly2D aqui: foram selecionados com os polígonos
-    //    originais do GeoSampa (mais confiáveis que o polígono derivado de difference).
-    //    O filtro de centróide nos triângulos de saída trata MultiPolygons.
-    for(const cp of contourPtsRel)
-      addPt(cp.lng,cp.lat,cp.z);
+    // B) Pontos de curvas de nível dentro do polígono — Z exato, sempre confiável
+    for(const cp of contourPtsRel){
+      try{
+        if(turf.booleanPointInPolygon(turf.point([cp.lng,cp.lat]),poly2D))
+          addPt(cp.lng,cp.lat,cp.z);
+      }catch(_){}
+    }
 
     if(pts.length<3) continue;
 
@@ -915,43 +916,37 @@ function App(){
         .map(p=>({lng:p.lng,lat:p.lat,z:Math.max(0,p.elev-datum)}));
       lg('ok',`${contourPtsRel.length} pontos de curva (resolução ${['','Normal','Alta','Máxima'][res]})`);
 
-      // 5b. Pré-classificar pontos de curva por categoria usando os polígonos
-      //     ORIGINAIS do GeoSampa — muito mais confiável que filtrar com o
-      //     polígono derivado de turf.difference (que tem buracos complexos).
-      //     Isso garante que a Rua só recebe pontos com elevações de rua real,
-      //     evitando pontos de quadra/calçada "escapando" para a Rua e causando
-      //     triângulos voando ou afundando.
-      lg('info','Pré-classificando pontos de curva por uso do solo...');
-      const _inFeats=(cp,feats)=>feats.some(f=>{
-        try{return turf.booleanPointInPolygon(turf.point([cp.lng,cp.lat]),f);}catch(_){return false;}
-      });
-      const _cats=contourPtsRel.map(cp=>{
-        if(qFeatsRaw.length&&_inFeats(cp,qFeatsRaw)) return 'q';
-        if(cFeatsRaw.length&&_inFeats(cp,cFeatsRaw)) return 'c';
-        return 'r';
-      });
-      const qCPts=contourPtsRel.filter((_,i)=>_cats[i]==='q');
-      const cCPts=contourPtsRel.filter((_,i)=>_cats[i]==='c');
-      const rCPts=contourPtsRel.filter((_,i)=>_cats[i]==='r');
-      lg('ok',`Curvas: ${qCPts.length} Quadra · ${cCPts.length} Calçada · ${rCPts.length} Rua`);
-
-      // 6. Importar Delaunator e fazer drape de cada polígono
-      const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
-      const STEP=5/111320; // ~5m em graus
-
-      const mkFC=feats=>({type:'FeatureCollection',features:feats});
+      // 5b. Quadra e Calçada: drapeFeature com os pontos de curva no buffer
+      // Rua: triângulos do TIN original filtrados por centróide (exclusão)
+      //      → Z sempre correto, sem risco de pontos de outras categorias
+      //        contaminarem a triangulação
 
       lg('info','Injetando Z e triangulando Quadra...');
-      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator,qCPts):[];
+      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator,contourPtsRel):[];
       lg('ok',`Quadra: ${qF.length} triângulos`);
 
       lg('info','Injetando Z e triangulando Calçada...');
-      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,cCPts):[];
+      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,contourPtsRel):[];
       lg('ok',`Calçada: ${cF.length} triângulos`);
 
-      lg('info','Injetando Z e triangulando Rua...');
-      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator,rCPts);
-      lg('ok',`Rua: ${rF.length} triângulos`);
+      // Rua: usar diretamente os triângulos do TIN cujo centróide NÃO está
+      // em nenhuma quadra nem calçada. O TIN original foi construído corretamente
+      // e tem Z exato em todos os vértices — não precisa de re-triangulação.
+      lg('info','Selecionando triângulos TIN para Rua (centróide por exclusão)...');
+      const allUrbanF=[...qFeatsRaw,...cFeatsRaw];
+      const rF=[];
+      for(const tri of tin.features){
+        const r=tri.geometry.coordinates[0];
+        const cx=(r[0][0]+r[1][0]+r[2][0])/3;
+        const cy=(r[0][1]+r[1][1]+r[2][1])/3;
+        const pt=turf.point([cx,cy]);
+        let hit=false;
+        for(const uf of allUrbanF){
+          try{if(turf.booleanPointInPolygon(pt,uf)){hit=true;break;}}catch(_){}
+        }
+        if(!hit) rF.push({...tri,properties:{...tri.properties,usage:'Rua'}});
+      }
+      lg('ok',`Rua: ${rF.length} triângulos (TIN original)`);
 
       if(!qF.length&&!cF.length&&!rF.length)
         throw new Error('Nenhum triângulo gerado — verifique as camadas');
