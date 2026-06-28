@@ -483,7 +483,7 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
       catch(_){continue;}
       const ha=A[2],hb=B[2],hc=C[2];
       out.push({type:'Feature',
-        properties:{avgH:(ha+hb+hc)/3,ha,hb,hc,usage},
+        properties:{avgH:(ha+hb+hc)/3,ha,hb,hc},
         geometry:{type:'Polygon',
           coordinates:[[[A[0],A[1],ha],[B[0],B[1],hb],[C[0],C[1],hc],[A[0],A[1],ha]]]}});
     }
@@ -803,7 +803,7 @@ function App(){
 
         const plain=valid.map(f=>({
           type:'Feature',geometry:f.geometry,
-          properties:{stackOrder:0,layerId,usage:cat}
+          properties:{stackOrder:0,layerId}
         }));
         const imported=await rpc.invoke('importRawSections',[plain]);
         if(!Array.isArray(imported)||!imported.length)
@@ -825,7 +825,7 @@ function App(){
               return parseFloat(bH.toFixed(4));
             });
           }else patch=orig.slice(0,3).map(v=>parseFloat((v[2]||0).toFixed(4)));
-          return{properties:{id:imp.properties?.id,patch,patchType:'slab',usage:cat}};
+          return{properties:{id:imp.properties?.id,patch,patchType:'slab'}};
         });
         const hasId=updates.filter(u=>u.properties.id).length;
         if(hasId<updates.length) lg('warn',`${cat}: ${updates.length-hasId} sem ID`);
@@ -944,7 +944,7 @@ function App(){
         for(const uf of allUrbanF){
           try{if(turf.booleanPointInPolygon(pt,uf)){hit=true;break;}}catch(_){}
         }
-        if(!hit) rF.push({...tri,properties:{...tri.properties,usage:'Rua'}});
+        if(!hit) rF.push({...tri});
       }
       lg('ok',`Rua: ${rF.length} triângulos (TIN original)`);
 
