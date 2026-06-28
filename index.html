@@ -398,14 +398,17 @@ function densifyRing(ring,stepDeg){
 }
 
 // ── Drape + Triangulação de um polígono 2D ────────────────────
-// 1. Adensa o anel externo (~5m) e injeta Z de cada vértice via TIN
-// 2. Injeta Z nos vértices dos anéis internos (buracos) sem adensá-los
-// 3. Triangula tudo com Delaunator
-// 4. Filtra triângulos cujo centróide esteja fora do polígono
-//    (automaticamente exclui triângulos em buracos e na área convexa
-//    externa para polígonos côncavos)
-// Retorna array de features de triângulo com {avgH,ha,hb,hc,usage}.
-function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator){
+// Combina dois conjuntos de pontos para o Delaunator:
+//   A) Vértices do anel externo (adensados ~5m) + anéis de buraco
+//      → cada vértice recebe Z do TIN via getZFromTIN
+//   B) Pontos de curvas de nível que caem DENTRO do polígono
+//      → esses têm elevação exata (rel. ao datum) já calculada
+// A combinação garante que o interior segue o relevo real, não uma
+// interpolação linear plana entre os vértices do polígono.
+// Filtro de centróide exclui triângulos fora do polígono (incluindo
+// buracos e área da envoltória convexa excedente).
+// contourPtsRel: [{lng,lat,z}] com z relativo ao datum (mesma escala do TIN).
+function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]){
   if(!feat?.geometry) return[];
   const polys=feat.geometry.type==='Polygon'?[feat.geometry.coordinates]
     :feat.geometry.type==='MultiPolygon'?feat.geometry.coordinates:[];
@@ -414,34 +417,41 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator){
   for(const polyCoords of polys){
     if(!polyCoords.length||!polyCoords[0]||polyCoords[0].length<4) continue;
 
-    // Coletar pontos: anel externo adensado + anéis internos sem adensamento
     const SNAP=5e-7;
     const seenP=new Map();
-    const pts=[];
-    const addPt=(lng,lat)=>{
+    const pts=[];                               // pontos finais [lng,lat,z]
+    const addPt=(lng,lat,z)=>{
       const k=`${lng/SNAP|0},${lat/SNAP|0}`;
       if(seenP.has(k)) return;
       seenP.set(k,true);
-      const z=getZFromTIN(lng,lat,tinFeatures);
-      pts.push([lng,lat,z!==null?z:0]);
+      pts.push([lng,lat,Math.max(0,z)]);
     };
 
-    // Anel externo — adensado para drape suave
+    // A) Anel externo adensado — Z do TIN (garante drape suave na borda)
     for(const[lng,lat] of densifyRing(polyCoords[0],stepDeg).slice(0,-1))
-      addPt(lng,lat);
+      addPt(lng,lat,getZFromTIN(lng,lat,tinFeatures));
 
-    // Anéis internos (buracos) — apenas vértices originais com Z
+    // A) Anéis internos (buracos) — apenas vértices originais com Z do TIN
     for(let ri=1;ri<polyCoords.length;ri++)
-      for(const[lng,lat] of polyCoords[ri]) addPt(lng,lat);
+      for(const[lng,lat] of polyCoords[ri])
+        addPt(lng,lat,getZFromTIN(lng,lat,tinFeatures));
+
+    // Polígono 2D (com buracos) — usado tanto para filtrar curvas quanto para centróide
+    const poly2D={type:'Feature',geometry:{type:'Polygon',
+      coordinates:polyCoords.map(r=>r.map(p=>[p[0],p[1]]))}};
+
+    // B) Pontos de curvas de nível dentro do polígono — elevação exata do terreno
+    for(const cp of contourPtsRel){
+      try{
+        if(turf.booleanPointInPolygon(turf.point([cp.lng,cp.lat]),poly2D))
+          addPt(cp.lng,cp.lat,cp.z);
+      }catch(_){}
+    }
 
     if(pts.length<3) continue;
 
-    // Triangulação Delaunay 2D
+    // Triangulação Delaunay (opera em 2D — Z não influencia a topologia)
     const d=new Delaunator(pts.flatMap(p=>[p[0],p[1]]));
-
-    // Polígono 2D completo (com buracos) para filtro de centróide
-    const poly2D={type:'Feature',geometry:{type:'Polygon',
-      coordinates:polyCoords.map(r=>r.map(p=>[p[0],p[1]]))}};
 
     for(let i=0;i<d.triangles.length;i+=3){
       const A=pts[d.triangles[i]],B=pts[d.triangles[i+1]],C=pts[d.triangles[i+2]];
@@ -876,22 +886,35 @@ function App(){
       }
       lg('ok',`Polígonos 2D calculados · Rua com ${rua2D?.geometry?.type||'?'}`);
 
-      // 5. Importar Delaunator e fazer drape de cada polígono
+      // 5. Preparar pontos das curvas com Z relativo ao datum
+      //    Esses pontos têm a elevação EXATA de cada curva — são a fonte de
+      //    verdade do terreno. Ao passá-los para drapeFeature, o interior de
+      //    cada polígono triangula com o relevo real, não apenas interpolação
+      //    linear entre os vértices do polígono.
+      const datum=stats.datum;
+      const ptsPerLine=res===1?20:res===2?80:500;
+      const rawCPts=samplePoints(fcs,ptsPerLine);
+      const contourPtsRel=rawCPts
+        .filter(p=>{try{return turf.booleanPointInPolygon([p.lng,p.lat],mae);}catch(_){return false;}})
+        .map(p=>({lng:p.lng,lat:p.lat,z:Math.max(0,p.elev-datum)}));
+      lg('ok',`${contourPtsRel.length} pontos de curva (resolução ${['','Normal','Alta','Máxima'][res]}) incluídos na triangulação`);
+
+      // 6. Importar Delaunator e fazer drape de cada polígono
       const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
       const STEP=5/111320; // ~5m em graus
 
       const mkFC=feats=>({type:'FeatureCollection',features:feats});
 
       lg('info','Injetando Z e triangulando Quadra...');
-      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator):[];
+      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator,contourPtsRel):[];
       lg('ok',`Quadra: ${qF.length} triângulos`);
 
       lg('info','Injetando Z e triangulando Calçada...');
-      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator):[];
+      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,contourPtsRel):[];
       lg('ok',`Calçada: ${cF.length} triângulos`);
 
       lg('info','Injetando Z e triangulando Rua (polígono com buracos)...');
-      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator);
+      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator,contourPtsRel);
       lg('ok',`Rua: ${rF.length} triângulos`);
 
       if(!qF.length&&!cF.length&&!rF.length)
