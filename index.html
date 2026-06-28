@@ -788,25 +788,29 @@ function App(){
       // Features sem layerId — Giraffe usa a layer ativa no momento
       const plain=valid.map(f=>({
         type:'Feature',geometry:f.geometry,
-        properties:{stackOrder:0,patchType:'slab'}
+        properties:{stackOrder:0}
       }));
-      const ids=await rpc.invoke('createRawSections',[plain]);
-      if(!Array.isArray(ids)||!ids.length)
-        throw new Error(`${cat}: createRawSections sem retorno`);
-      lg('ok',`${cat}: ${ids.length} seções criadas`);
+      const imported=await rpc.invoke('importRawSections',[plain]);
+      if(!Array.isArray(imported)||!imported.length)
+        throw new Error(`${cat}: importRawSections sem retorno`);
+      lg('ok',`${cat}: ${imported.length} seções criadas`);
       setPct(55);
 
       // Patch por vértice via TIN completo (evita triângulos planos)
-      const updates=ids.map((id,i)=>{
-        const ring=valid[i].geometry.coordinates[0];
-        const patch=ring.slice(0,3).map(v=>
-          parseFloat(getZFromTIN(v[0],v[1],tin.features).toFixed(4))
+      const updates=imported.map((imp,i)=>{
+        const impR=imp.geometry?.coordinates?.[0];
+        const patch=(impR&&impR.length>=3
+          ?impR.slice(0,3).map(([iLng,iLat])=>
+              parseFloat(getZFromTIN(iLng,iLat,tin.features).toFixed(4)))
+          :valid[i].geometry.coordinates[0].slice(0,3).map(v=>
+              parseFloat((v[2]||0).toFixed(4)))
         );
-        return{properties:{id,patch,patchType:'slab'}};
+        return{properties:{id:imp.properties?.id,patch,patchType:'slab'}};
       });
-      await rpc.invoke('updateRawSections',[updates]);
+      const vu=updates.filter(u=>u.properties.id);
+      await rpc.invoke('updateRawSections',[vu]);
       setPct(100);
-      lg('ok',`${cat}: ✓ ${ids.length} patches aplicados`);
+      lg('ok',`${cat}: ✓ ${vu.length} patches aplicados`);
       setPhase('done');
     }catch(e){
       lg('err',`Fixar ${cat}: ${e.message}`);
