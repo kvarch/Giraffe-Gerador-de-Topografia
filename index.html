@@ -461,13 +461,12 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
         if(z!==null) addPt(lng,lat,z);
       }
 
-    // B) Pontos de curvas de nível dentro do polígono — Z exato, sempre confiável
-    for(const cp of contourPtsRel){
-      try{
-        if(turf.booleanPointInPolygon(turf.point([cp.lng,cp.lat]),poly2D))
-          addPt(cp.lng,cp.lat,cp.z);
-      }catch(_){}
-    }
+    // B) Pontos de curvas de nível — já pré-classificados para esta categoria
+    //    Não precisam de filtro poly2D aqui: foram selecionados com os polígonos
+    //    originais do GeoSampa (mais confiáveis que o polígono derivado de difference).
+    //    O filtro de centróide nos triângulos de saída trata MultiPolygons.
+    for(const cp of contourPtsRel)
+      addPt(cp.lng,cp.lat,cp.z);
 
     if(pts.length<3) continue;
 
@@ -908,17 +907,33 @@ function App(){
       lg('ok',`Polígonos 2D calculados · Rua com ${rua2D?.geometry?.type||'?'}`);
 
       // 5. Preparar pontos das curvas com Z relativo ao datum
-      //    Esses pontos têm a elevação EXATA de cada curva — são a fonte de
-      //    verdade do terreno. Ao passá-los para drapeFeature, o interior de
-      //    cada polígono triangula com o relevo real, não apenas interpolação
-      //    linear entre os vértices do polígono.
       const datum=stats.datum;
       const ptsPerLine=res===1?20:res===2?80:500;
       const rawCPts=samplePoints(fcs,ptsPerLine);
       const contourPtsRel=rawCPts
         .filter(p=>{try{return turf.booleanPointInPolygon([p.lng,p.lat],mae);}catch(_){return false;}})
         .map(p=>({lng:p.lng,lat:p.lat,z:Math.max(0,p.elev-datum)}));
-      lg('ok',`${contourPtsRel.length} pontos de curva (resolução ${['','Normal','Alta','Máxima'][res]}) incluídos na triangulação`);
+      lg('ok',`${contourPtsRel.length} pontos de curva (resolução ${['','Normal','Alta','Máxima'][res]})`);
+
+      // 5b. Pré-classificar pontos de curva por categoria usando os polígonos
+      //     ORIGINAIS do GeoSampa — muito mais confiável que filtrar com o
+      //     polígono derivado de turf.difference (que tem buracos complexos).
+      //     Isso garante que a Rua só recebe pontos com elevações de rua real,
+      //     evitando pontos de quadra/calçada "escapando" para a Rua e causando
+      //     triângulos voando ou afundando.
+      lg('info','Pré-classificando pontos de curva por uso do solo...');
+      const _inFeats=(cp,feats)=>feats.some(f=>{
+        try{return turf.booleanPointInPolygon(turf.point([cp.lng,cp.lat]),f);}catch(_){return false;}
+      });
+      const _cats=contourPtsRel.map(cp=>{
+        if(qFeatsRaw.length&&_inFeats(cp,qFeatsRaw)) return 'q';
+        if(cFeatsRaw.length&&_inFeats(cp,cFeatsRaw)) return 'c';
+        return 'r';
+      });
+      const qCPts=contourPtsRel.filter((_,i)=>_cats[i]==='q');
+      const cCPts=contourPtsRel.filter((_,i)=>_cats[i]==='c');
+      const rCPts=contourPtsRel.filter((_,i)=>_cats[i]==='r');
+      lg('ok',`Curvas: ${qCPts.length} Quadra · ${cCPts.length} Calçada · ${rCPts.length} Rua`);
 
       // 6. Importar Delaunator e fazer drape de cada polígono
       const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
@@ -927,15 +942,15 @@ function App(){
       const mkFC=feats=>({type:'FeatureCollection',features:feats});
 
       lg('info','Injetando Z e triangulando Quadra...');
-      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator,contourPtsRel):[];
+      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator,qCPts):[];
       lg('ok',`Quadra: ${qF.length} triângulos`);
 
       lg('info','Injetando Z e triangulando Calçada...');
-      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,contourPtsRel):[];
+      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,cCPts):[];
       lg('ok',`Calçada: ${cF.length} triângulos`);
 
-      lg('info','Injetando Z e triangulando Rua (polígono com buracos)...');
-      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator,contourPtsRel);
+      lg('info','Injetando Z e triangulando Rua...');
+      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator,rCPts);
       lg('ok',`Rua: ${rF.length} triângulos`);
 
       if(!qF.length&&!cF.length&&!rF.length)
