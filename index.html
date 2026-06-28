@@ -816,15 +816,18 @@ function App(){
           const impR=imp.geometry?.coordinates?.[0];
           let patch;
           if(impR&&impR.length>=3){
-            patch=impR.slice(0,3).map(([iLng,iLat])=>{
-              let bH=0,bD=Infinity;
-              for(const[oLng,oLat,oH=0] of orig.slice(0,3)){
-                const d=Math.hypot(iLng-oLng,iLat-oLat);
-                if(d<bD){bD=d;bH=oH;}
-              }
-              return parseFloat(bH.toFixed(4));
-            });
-          }else patch=orig.slice(0,3).map(v=>parseFloat((v[2]||0).toFixed(4)));
+            // Interpola Z individualmente para cada vértice importado usando
+            // o TIN completo (getZFromTIN), não apenas os 3 vértices do triângulo pai.
+            // O nearest-neighbor entre 3 pontos falha quando o Giraffe reordena
+            // os vértices: dois vértices podem encontrar o mesmo vértice original
+            // como mais próximo → Z idêntico → triângulo plano incorreto.
+            patch=impR.slice(0,3).map(([iLng,iLat])=>
+              parseFloat(getZFromTIN(iLng,iLat,tin.features).toFixed(4))
+            );
+          }else{
+            // Fallback quando Giraffe não retorna geometria: usar Z direto das coords
+            patch=orig.slice(0,3).map(v=>parseFloat((v[2]||0).toFixed(4)));
+          }
           return{properties:{id:imp.properties?.id,patch,patchType:'slab'}};
         });
         const hasId=updates.filter(u=>u.properties.id).length;
