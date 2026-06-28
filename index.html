@@ -509,6 +509,7 @@ function App(){
   const[logs,setLogs]=useState([]);
   const logEl=useRef(null);
   const[splitFcs,setSplitFcs]=useState(null);
+  const[fixBusy,setFixBusy]=useState(false);
   const[splitVis,setSplitVis]=useState({Quadra:true,Calçada:true,Rua:true});
   const[splitBusy,setSplitBusy]=useState(false);
 
@@ -762,55 +763,55 @@ function App(){
     }
   };
 
-  // ─── Fixar: exportar cada categoria como layer GeoJSON nomeado ──
-  // Usa updateGeoJSONLayerContents — wrapper oficial que cria ou atualiza
-  // a layer automaticamente sem depender de "layer ativo" no Giraffe.
-  const doFixar=async()=>{
-    if(!tin||phase!=='r_patch'||busy) return;
-    setPhase('patch');setPct(0);
-    const cats=splitFcs?Object.entries(splitFcs):[['Terreno',tin]];
-    const nCats=cats.length;
-    lg('info',`━━ Exportando ${nCats} camada(s) → GeoJSON layers ━━`);
+  // ─── Fixar categoria: envia triângulos para a layer ATIVA no Giraffe ───
+  // O usuário ativa a camada desejada no painel do Giraffe antes de clicar.
+  // createRawSections roteia automaticamente para a layer ativa.
+  // Sem layerId, createDrawingLayer ou qualquer automação de camadas.
+  const doFixarCat=async(cat)=>{
+    if(fixBusy||!hasTin) return;
+    const fc=cat==='Terreno'?tin:splitFcs?.[cat];
+    if(!fc?.features?.length){lg('warn',`${cat}: sem dados`);return;}
+    setFixBusy(true);setPhase('patch');setPct(0);
     try{
-      let total=0;
-      for(let ci=0;ci<nCats;ci++){
-        const[cat,fc]=cats[ci];
-        const p0=Math.round(ci/nCats*100),p1=Math.round((ci+1)/nCats*100);
-        const pp=t=>p0+Math.round((p1-p0)*t);
+      const valid=fc.features.filter(f=>{
+        const r=f.geometry.coordinates[0];
+        if(!r||r.length<4) return false;
+        const[[ax,ay],[bx,by],[cx,cy]]=r;
+        return[ax,ay,bx,by,cx,cy].every(Number.isFinite)
+          &&Math.abs((bx-ax)*(cy-ay)-(cx-ax)*(by-ay))>1e-12;
+      });
+      if(!valid.length){lg('warn',`${cat}: sem triângulos válidos`);return;}
+      const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
+      lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
+      setPct(10);
 
-        // Filtrar triângulos válidos
-        const valid=fc.features.filter(f=>{
-          const r=f.geometry.coordinates[0];
-          if(!r||r.length<4) return false;
-          const[[ax,ay],[bx,by],[cx,cy]]=r;
-          return[ax,ay,bx,by,cx,cy].every(Number.isFinite)
-            &&Math.abs((bx-ax)*(cy-ay)-(cx-ax)*(by-ay))>1e-12;
-        });
-        if(!valid.length){lg('warn',`${cat}: sem triângulos — pulando.`);continue;}
-        const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
-        lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
-        setPct(pp(.10));
+      // Features sem layerId — Giraffe usa a layer ativa no momento
+      const plain=valid.map(f=>({
+        type:'Feature',geometry:f.geometry,
+        properties:{stackOrder:0,patchType:'slab'}
+      }));
+      const ids=await rpc.invoke('createRawSections',[plain]);
+      if(!Array.isArray(ids)||!ids.length)
+        throw new Error(`${cat}: createRawSections sem retorno`);
+      lg('ok',`${cat}: ${ids.length} seções criadas`);
+      setPct(55);
 
-        // Serializar para evitar propriedades internas não serializáveis (turf)
-        const fc3D=JSON.parse(JSON.stringify({
-          type:'FeatureCollection',
-          features:valid
-        }));
-        const layerName=`Terreno · ${cat}`;
-        await rpc.invoke('updateGeoJSONLayerContents',[layerName,fc3D]);
-        lg('ok',`${cat}: ✓ ${valid.length} triângulos → "${layerName}"`);
-        total+=valid.length;
-        setPct(pp(.97));
-      }
-      // Remover temp layers de preview
-      try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
-      for(const id of Object.values(SPLIT_IDS)){
-        try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
-      }
+      // Patch por vértice via TIN completo (evita triângulos planos)
+      const updates=ids.map((id,i)=>{
+        const ring=valid[i].geometry.coordinates[0];
+        const patch=ring.slice(0,3).map(v=>
+          parseFloat(getZFromTIN(v[0],v[1],tin.features).toFixed(4))
+        );
+        return{properties:{id,patch,patchType:'slab'}};
+      });
+      await rpc.invoke('updateRawSections',[updates]);
       setPct(100);
-      lg('ok',`✓ ${total} triângulos exportados em ${nCats} layer(s)`);
+      lg('ok',`${cat}: ✓ ${ids.length} patches aplicados`);
       setPhase('done');
-    }catch(e){lg('err',`Erro: ${e.message}`);setPhase('r_patch');setPct(0);}
+    }catch(e){
+      lg('err',`Fixar ${cat}: ${e.message}`);
+      setPhase('r_patch');setPct(0);
+    }finally{setFixBusy(false);}
   };
 
   // ─── Drape das camadas urbanas sobre o TIN ──────────────────
@@ -1082,15 +1083,38 @@ function App(){
           h('span',{className:bdg(['r_gen','fetch','tin','r_patch','patch'])},'3'),
           h('span',{style:{fontSize:'11px',fontWeight:600}},'Gerar Terreno')
         ),
-        h('div',{style:{display:'flex',gap:'4px'}},
-          h('button',{className:'btn btn-pri',style:{fontSize:'10px',padding:'4px 9px'},
-            onClick:doCalc,disabled:!canGen},
-            isCalc?'⏳ Calculando...':'▶ Calcular'),
-          h('button',{className:'btn btn-grn',style:{fontSize:'10px',padding:'4px 9px'},
-            title:'Criar patches 3D editáveis no projeto',
-            onClick:doFixar,disabled:!canPatch},
-            phase==='patch'?'⏳':'📌 Fixar Patches')
-        )
+        h('button',{className:'btn btn-pri',style:{fontSize:'10px',padding:'4px 9px'},
+          onClick:doCalc,disabled:!canGen},
+          isCalc?'⏳ Calculando...':'▶ Calcular')
+      ),
+
+      // Botões de fixar patches — separados por categoria
+      hasTin&&h('div',{style:{flexShrink:0,marginBottom:'4px'}},
+        h('div',{style:{fontSize:'9px',color:'#555',lineHeight:1.4,marginBottom:'5px',padding:'4px 6px',background:'#080808',borderRadius:'3px',border:'1px solid #141414'}},
+          '⚠ Ative a camada desejada no painel do Giraffe antes de clicar no botão correspondente.'
+        ),
+        splitFcs
+          ?h('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'3px'}},
+              [['Quadra','#c87137'],['Calçada','#7a8fa6'],['Rua','#3a3a3a']].map(([cat,cor])=>
+                h('button',{
+                  key:cat,
+                  className:'btn',
+                  onClick:()=>doFixarCat(cat),
+                  disabled:fixBusy||!splitFcs?.[cat]?.features?.length,
+                  style:{fontSize:'9px',padding:'4px 2px',border:`1px solid ${cor}44`,color:fixBusy?'#333':cor,cursor:'pointer'}
+                },
+                  fixBusy?'⏳':`📌 ${cat}`
+                )
+              )
+            )
+          :h('button',{
+              className:'btn btn-grn',
+              style:{width:'100%',fontSize:'10px',padding:'4px 9px'},
+              onClick:()=>doFixarCat('Terreno'),
+              disabled:fixBusy||!canPatch
+            },
+            fixBusy?'⏳ Fixando...':'📌 Fixar Terreno'
+          )
       ),
 
       // Barra de progresso
