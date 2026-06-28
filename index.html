@@ -454,9 +454,11 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
       if(z!==null) addPt(lng,lat,z);
     }
 
-    // A) Anéis internos (buracos) — apenas se strictZ não for null
+    // A) Anéis internos (buracos) — TAMBÉM adensados, mesmo passo do anel externo
+    //    Sem densificação, arestas longas da fronteira calçada/quadra na Rua ficam
+    //    com apenas 2 pontos → triângulos enormes nessa região.
     for(let ri=1;ri<polyCoords.length;ri++)
-      for(const[lng,lat] of polyCoords[ri]){
+      for(const[lng,lat] of densifyRing(polyCoords[ri],stepDeg).slice(0,-1)){
         const z=strictZ(lng,lat);
         if(z!==null) addPt(lng,lat,z);
       }
@@ -903,7 +905,11 @@ function App(){
       //    linear entre os vértices do polígono.
       const datum=stats.datum;
       const ptsPerLine=res===1?20:res===2?80:500;
-      const rawCPts=samplePoints(fcs,ptsPerLine);
+      // Pontos das curvas para triangulação interna:
+      // Usa TODOS os vértices originais (step=1) independente do res.
+      // O res controla a densidade do TIN inicial (doCalc), mas aqui
+      // queremos máxima fidelidade às curvas de nível para o drape.
+      const rawCPts=samplePoints(fcs,Number.MAX_SAFE_INTEGER); // step=1 → todos os pontos
       const contourPtsRel=rawCPts
         .filter(p=>{try{return turf.booleanPointInPolygon([p.lng,p.lat],mae);}catch(_){return false;}})
         .map(p=>({lng:p.lng,lat:p.lat,z:Math.max(0,p.elev-datum)}));
@@ -911,7 +917,7 @@ function App(){
 
       // 6. Importar Delaunator e fazer drape de cada polígono
       const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
-      const STEP=5/111320; // ~5m em graus
+      const STEP=2/111320; // ~2m em graus (era 5m — reduzido para mais resolução nas bordas)
 
       const mkFC=feats=>({type:'FeatureCollection',features:feats});
 
