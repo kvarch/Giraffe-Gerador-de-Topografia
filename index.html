@@ -762,20 +762,23 @@ function App(){
     }
   };
 
-  // ─── Fixar patches (cria layer separada por categoria) ─────────
+  // ─── Fixar: exportar cada categoria como layer GeoJSON nomeado ──
+  // Usa updateGeoJSONLayerContents — wrapper oficial que cria ou atualiza
+  // a layer automaticamente sem depender de "layer ativo" no Giraffe.
   const doFixar=async()=>{
     if(!tin||phase!=='r_patch'||busy) return;
     setPhase('patch');setPct(0);
     const cats=splitFcs?Object.entries(splitFcs):[['Terreno',tin]];
     const nCats=cats.length;
-    lg('info',`━━ Patches 3D — ${nCats===1?'terreno unificado':`${nCats} layers separadas`} ━━`);
+    lg('info',`━━ Exportando ${nCats} camada(s) → GeoJSON layers ━━`);
     try{
       let total=0;
-
       for(let ci=0;ci<nCats;ci++){
         const[cat,fc]=cats[ci];
         const p0=Math.round(ci/nCats*100),p1=Math.round((ci+1)/nCats*100);
         const pp=t=>p0+Math.round((p1-p0)*t);
+
+        // Filtrar triângulos válidos
         const valid=fc.features.filter(f=>{
           const r=f.geometry.coordinates[0];
           if(!r||r.length<4) return false;
@@ -786,63 +789,26 @@ function App(){
         if(!valid.length){lg('warn',`${cat}: sem triângulos — pulando.`);continue;}
         const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
         lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
-        setPct(pp(.05));
+        setPct(pp(.10));
 
-        // ── Criar → Ativar → Importar (sequencial, por categoria) ──────
-        // O Giraffe roteia geometrias pelo "layer ativo" no momento do import.
-        // activateDrawingLayer deve ser chamado imediatamente antes do import.
-        // O retorno de createDrawingLayer é passado direto para activateDrawingLayer.
-        try{
-          const layerHandle=await rpc.invoke('createDrawingLayer',[`Terreno · ${cat}`]);
-          await rpc.invoke('activateDrawingLayer',[layerHandle]);
-          lg('ok',`${cat}: layer criada e ativada`);
-        }catch(e){
-          lg('warn',`${cat}: layer falhou (${e.message?.slice(0,50)})`);
-        }
-        setPct(pp(.12));
-
-        const plain=valid.map(f=>({
-          type:'Feature',geometry:f.geometry,
-          properties:{stackOrder:0,layerId:'default'}
+        // Serializar para evitar propriedades internas não serializáveis (turf)
+        const fc3D=JSON.parse(JSON.stringify({
+          type:'FeatureCollection',
+          features:valid
         }));
-        const imported=await rpc.invoke('importRawSections',[plain]);
-        if(!Array.isArray(imported)||!imported.length)
-          throw new Error(`${cat}: importRawSections sem retorno`);
-        lg('ok',`${cat}: ${imported.length} seções criadas`);
-        setPct(pp(.50));
-
-        const updates=imported.map((imp,i)=>{
-          const orig=valid[i].geometry.coordinates[0];
-          const impR=imp.geometry?.coordinates?.[0];
-          let patch;
-          if(impR&&impR.length>=3){
-            // Interpola Z individualmente para cada vértice importado usando
-            // o TIN completo (getZFromTIN), não apenas os 3 vértices do triângulo pai.
-            // O nearest-neighbor entre 3 pontos falha quando o Giraffe reordena
-            // os vértices: dois vértices podem encontrar o mesmo vértice original
-            // como mais próximo → Z idêntico → triângulo plano incorreto.
-            patch=impR.slice(0,3).map(([iLng,iLat])=>
-              parseFloat(getZFromTIN(iLng,iLat,tin.features).toFixed(4))
-            );
-          }else{
-            // Fallback quando Giraffe não retorna geometria: usar Z direto das coords
-            patch=orig.slice(0,3).map(v=>parseFloat((v[2]||0).toFixed(4)));
-          }
-          return{properties:{id:imp.properties?.id,patch,patchType:'slab'}};
-        });
-        const hasId=updates.filter(u=>u.properties.id).length;
-        if(hasId<updates.length) lg('warn',`${cat}: ${updates.length-hasId} sem ID`);
-        setPct(pp(.75));
-        const vu=updates.filter(u=>u.properties.id);
-        await rpc.invoke('updateRawSections',[vu]);
-        total+=vu.length;setPct(pp(.97));
-        lg('ok',`${cat}: ✓ ${vu.length} patches aplicados`);
+        const layerName=`Terreno · ${cat}`;
+        await rpc.invoke('updateGeoJSONLayerContents',[layerName,fc3D]);
+        lg('ok',`${cat}: ✓ ${valid.length} triângulos → "${layerName}"`);
+        total+=valid.length;
+        setPct(pp(.97));
       }
+      // Remover temp layers de preview
       try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
       for(const id of Object.values(SPLIT_IDS)){
         try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
       }
-      setPct(100);lg('ok',`✓ ${total} patches — ${nCats} layer(s) criada(s)!`);
+      setPct(100);
+      lg('ok',`✓ ${total} triângulos exportados em ${nCats} layer(s)`);
       setPhase('done');
     }catch(e){lg('err',`Erro: ${e.message}`);setPhase('r_patch');setPct(0);}
   };
