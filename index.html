@@ -908,20 +908,22 @@ function App(){
       lg('ok',`Polígonos 2D calculados · Rua com ${rua2D?.geometry?.type||'?'}`);
 
       // 5. Preparar pontos das curvas com Z relativo ao datum
+      //    Esses pontos têm a elevação EXATA de cada curva — são a fonte de
+      //    verdade do terreno. Ao passá-los para drapeFeature, o interior de
+      //    cada polígono triangula com o relevo real, não apenas interpolação
+      //    linear entre os vértices do polígono.
       const datum=stats.datum;
       const ptsPerLine=res===1?20:res===2?80:500;
       const rawCPts=samplePoints(fcs,ptsPerLine);
       const contourPtsRel=rawCPts
         .filter(p=>{try{return turf.booleanPointInPolygon([p.lng,p.lat],mae);}catch(_){return false;}})
         .map(p=>({lng:p.lng,lat:p.lat,z:Math.max(0,p.elev-datum)}));
-      lg('ok',`${contourPtsRel.length} pontos de curva (resolução ${['','Normal','Alta','Máxima'][res]})`);
+      lg('ok',`${contourPtsRel.length} pontos de curva (resolução ${['','Normal','Alta','Máxima'][res]}) incluídos na triangulação`);
 
-      // 5b. Quadra e Calçada: drapeFeature com os pontos de curva no buffer
-      // Rua: triângulos do TIN original filtrados por centróide (exclusão)
-      //      → Z sempre correto, sem risco de pontos de outras categorias
-      //        contaminarem a triangulação
+      // 6. Importar Delaunator e fazer drape de cada polígono
       const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
       const STEP=5/111320; // ~5m em graus
+
       const mkFC=feats=>({type:'FeatureCollection',features:feats});
 
       lg('info','Injetando Z e triangulando Quadra...');
@@ -932,24 +934,9 @@ function App(){
       const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,contourPtsRel):[];
       lg('ok',`Calçada: ${cF.length} triângulos`);
 
-      // Rua: usar diretamente os triângulos do TIN cujo centróide NÃO está
-      // em nenhuma quadra nem calçada. O TIN original foi construído corretamente
-      // e tem Z exato em todos os vértices — não precisa de re-triangulação.
-      lg('info','Selecionando triângulos TIN para Rua (centróide por exclusão)...');
-      const allUrbanF=[...qFeatsRaw,...cFeatsRaw];
-      const rF=[];
-      for(const tri of tin.features){
-        const r=tri.geometry.coordinates[0];
-        const cx=(r[0][0]+r[1][0]+r[2][0])/3;
-        const cy=(r[0][1]+r[1][1]+r[2][1])/3;
-        const pt=turf.point([cx,cy]);
-        let hit=false;
-        for(const uf of allUrbanF){
-          try{if(turf.booleanPointInPolygon(pt,uf)){hit=true;break;}}catch(_){}
-        }
-        if(!hit) rF.push({...tri});
-      }
-      lg('ok',`Rua: ${rF.length} triângulos (TIN original)`);
+      lg('info','Injetando Z e triangulando Rua (polígono com buracos)...');
+      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator,contourPtsRel);
+      lg('ok',`Rua: ${rF.length} triângulos`);
 
       if(!qF.length&&!cF.length&&!rF.length)
         throw new Error('Nenhum triângulo gerado — verifique as camadas');
