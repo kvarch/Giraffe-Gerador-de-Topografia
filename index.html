@@ -772,24 +772,6 @@ function App(){
     try{
       let total=0;
 
-      // ── Passo 0: criar todos os layers ANTES do loop e capturar IDs ──
-      // createDrawingLayer retorna o ID que deve ser injetado em layerId
-      // das features para o Giraffe rotear as seções corretamente.
-      // Se retornar objeto, extrai o ID; se retornar string, usa direto.
-      const layerIdMap={};
-      for(const[cat] of cats){
-        try{
-          const raw=await rpc.invoke('createDrawingLayer',[`Terreno · ${cat}`]);
-          // Normaliza: pode ser string ou objeto com .id / .layerId
-          const lid=typeof raw==='string'?raw
-            :raw?.id??raw?.layerId??null;
-          if(lid) layerIdMap[cat]=lid;
-          lg('ok',`Layer "Terreno · ${cat}" → ID: ${String(lid||'n/a').slice(0,20)}`);
-        }catch(e){
-          lg('warn',`Layer ${cat}: ${e.message?.slice(0,50)}`);
-        }
-      }
-
       for(let ci=0;ci<nCats;ci++){
         const[cat,fc]=cats[ci];
         const p0=Math.round(ci/nCats*100),p1=Math.round((ci+1)/nCats*100);
@@ -806,18 +788,27 @@ function App(){
         lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
         setPct(pp(.05));
 
-        // ID do layer desta categoria (ou 'default' como fallback)
-        const layerId=layerIdMap[cat]||'default';
+        // ── Criar → Ativar → Importar (sequencial, por categoria) ──────
+        // O Giraffe roteia geometrias pelo "layer ativo" no momento do import.
+        // activateDrawingLayer deve ser chamado imediatamente antes do import.
+        // O retorno de createDrawingLayer é passado direto para activateDrawingLayer.
+        try{
+          const layerHandle=await rpc.invoke('createDrawingLayer',[`Terreno · ${cat}`]);
+          await rpc.invoke('activateDrawingLayer',[layerHandle]);
+          lg('ok',`${cat}: layer criada e ativada`);
+        }catch(e){
+          lg('warn',`${cat}: layer falhou (${e.message?.slice(0,50)})`);
+        }
+        setPct(pp(.12));
 
-        // Injetar layerId correto nas features antes do importRawSections
         const plain=valid.map(f=>({
           type:'Feature',geometry:f.geometry,
-          properties:{stackOrder:0,layerId}
+          properties:{stackOrder:0,layerId:'default'}
         }));
         const imported=await rpc.invoke('importRawSections',[plain]);
         if(!Array.isArray(imported)||!imported.length)
           throw new Error(`${cat}: importRawSections sem retorno`);
-        lg('ok',`${cat}: ${imported.length} seções → layer ${String(layerId).slice(0,20)}`);
+        lg('ok',`${cat}: ${imported.length} seções criadas`);
         setPct(pp(.50));
 
         const updates=imported.map((imp,i)=>{
