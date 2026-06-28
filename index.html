@@ -399,15 +399,15 @@ function densifyRing(ring,stepDeg){
 
 // ── Drape + Triangulação de um polígono 2D ────────────────────
 // Combina dois conjuntos de pontos para o Delaunator:
-//   A) Vértices do anel externo (adensados ~5m) + anéis de buraco
-//      → cada vértice recebe Z do TIN via getZFromTIN
-//   B) Pontos de curvas de nível que caem DENTRO do polígono
-//      → esses têm elevação exata (rel. ao datum) já calculada
-// A combinação garante que o interior segue o relevo real, não uma
-// interpolação linear plana entre os vértices do polígono.
-// Filtro de centróide exclui triângulos fora do polígono (incluindo
-// buracos e área da envoltória convexa excedente).
-// contourPtsRel: [{lng,lat,z}] com z relativo ao datum (mesma escala do TIN).
+//   A) Vértices do polígono (anel externo adensado + buracos)
+//      → Z interpolado pelo TIN com strictZ (SEM fallback de vértice próximo)
+//      → Pontos fora da cobertura do TIN são DESCARTADOS (não adicionados)
+//      → Isso evita o bug de "triângulo voando": o fallback retornava o Z
+//        do vértice TIN mais próximo, que pode estar em cota completamente
+//        diferente da real naquele ponto do perímetro do buffer.
+//   B) Pontos de curvas de nível dentro do polígono
+//      → Z exato (cp.elev − datum), fonte de verdade do terreno
+// O polígono 2D (com buracos) filtra os triângulos pelo centróide.
 function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]){
   if(!feat?.geometry) return[];
   const polys=feat.geometry.type==='Polygon'?[feat.geometry.coordinates]
@@ -417,9 +417,26 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
   for(const polyCoords of polys){
     if(!polyCoords.length||!polyCoords[0]||polyCoords[0].length<4) continue;
 
+    // Interpolação ESTRITA — retorna null se fora do TIN (sem fallback)
+    // Usada para os vértices do polígono: descarta se fora da cobertura
+    const strictZ=(lng,lat)=>{
+      for(const tri of tinFeatures){
+        const r=tri.geometry.coordinates[0];
+        const[ax,ay,az=0]=r[0],[bx,by,bz=0]=r[1],[cx,cy,cz=0]=r[2];
+        const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
+        if(Math.abs(det)<1e-14) continue;
+        const w1=((by-cy)*(lng-cx)+(cx-bx)*(lat-cy))/det;
+        const w2=((cy-ay)*(lng-cx)+(ax-cx)*(lat-cy))/det;
+        const w3=1-w1-w2;
+        if(w1>=-1e-3&&w2>=-1e-3&&w3>=-1e-3)
+          return Math.max(0,w1*az+w2*bz+w3*cz);
+      }
+      return null; // fora do TIN — NÃO usar fallback aqui
+    };
+
     const SNAP=5e-7;
     const seenP=new Map();
-    const pts=[];                               // pontos finais [lng,lat,z]
+    const pts=[];
     const addPt=(lng,lat,z)=>{
       const k=`${lng/SNAP|0},${lat/SNAP|0}`;
       if(seenP.has(k)) return;
@@ -427,20 +444,24 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
       pts.push([lng,lat,Math.max(0,z)]);
     };
 
-    // A) Anel externo adensado — Z do TIN (garante drape suave na borda)
-    for(const[lng,lat] of densifyRing(polyCoords[0],stepDeg).slice(0,-1))
-      addPt(lng,lat,getZFromTIN(lng,lat,tinFeatures));
-
-    // A) Anéis internos (buracos) — apenas vértices originais com Z do TIN
-    for(let ri=1;ri<polyCoords.length;ri++)
-      for(const[lng,lat] of polyCoords[ri])
-        addPt(lng,lat,getZFromTIN(lng,lat,tinFeatures));
-
-    // Polígono 2D (com buracos) — usado tanto para filtrar curvas quanto para centróide
+    // Polígono 2D (com buracos) — criado primeiro para filtrar pontos de curva
     const poly2D={type:'Feature',geometry:{type:'Polygon',
       coordinates:polyCoords.map(r=>r.map(p=>[p[0],p[1]]))}};
 
-    // B) Pontos de curvas de nível dentro do polígono — elevação exata do terreno
+    // A) Anel externo adensado — apenas se strictZ não for null
+    for(const[lng,lat] of densifyRing(polyCoords[0],stepDeg).slice(0,-1)){
+      const z=strictZ(lng,lat);
+      if(z!==null) addPt(lng,lat,z);
+    }
+
+    // A) Anéis internos (buracos) — apenas se strictZ não for null
+    for(let ri=1;ri<polyCoords.length;ri++)
+      for(const[lng,lat] of polyCoords[ri]){
+        const z=strictZ(lng,lat);
+        if(z!==null) addPt(lng,lat,z);
+      }
+
+    // B) Pontos de curvas de nível dentro do polígono — Z exato, sempre confiável
     for(const cp of contourPtsRel){
       try{
         if(turf.booleanPointInPolygon(turf.point([cp.lng,cp.lat]),poly2D))
@@ -450,7 +471,7 @@ function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator,contourPtsRel=[]
 
     if(pts.length<3) continue;
 
-    // Triangulação Delaunay (opera em 2D — Z não influencia a topologia)
+    // Triangulação Delaunay (opera em 2D — Z não afeta a topologia)
     const d=new Delaunator(pts.flatMap(p=>[p[0],p[1]]));
 
     for(let i=0;i<d.triangles.length;i+=3){
