@@ -785,10 +785,13 @@ function App(){
       lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
       setPct(10);
 
-      // Features sem layerId — Giraffe usa a layer ativa no momento
+      // Features com layerId:'default' (campo obrigatório pelo SDK interno do Giraffe —
+      // sem ele o importRawSections falha com 'cleanedSections undefined').
+      // O roteamento para a drawing layer correta é feito pelo painel do Giraffe
+      // (a layer que o usuário ativou antes de clicar no botão).
       const plain=valid.map(f=>({
         type:'Feature',geometry:f.geometry,
-        properties:{stackOrder:0}
+        properties:{stackOrder:0,layerId:'default'}
       }));
       const imported=await rpc.invoke('importRawSections',[plain]);
       if(!Array.isArray(imported)||!imported.length)
