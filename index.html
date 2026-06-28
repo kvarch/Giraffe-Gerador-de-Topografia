@@ -787,28 +787,29 @@ function App(){
         lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
         setPct(pp(.03));
 
-        // Criar drawing layer dedicada para esta categoria
-        let layerId='default';
+        // Criar drawing layer dedicada e ativá-la antes do import.
+        // activateDrawingLayer é o que define para onde vão as novas seções.
+        // O layerId na propriedade da seção é sempre 'default' (sub-layer interno
+        // do Giraffe dentro de qualquer drawing layer — não o UUID da layer).
         try{
           const dl=await rpc.invoke('createDrawingLayer',[`Terreno · ${cat}`]);
           if(dl?.id){
-            layerId=dl.id;
-            await rpc.invoke('activateDrawingLayer',[layerId]);
-            lg('ok',`${cat}: layer criada (${layerId.slice(0,10)}...)`);
+            await rpc.invoke('activateDrawingLayer',[dl.id]);
+            lg('ok',`${cat}: layer "Terreno · ${cat}" criada e ativada`);
           }
         }catch(e){
-          lg('warn',`${cat}: layer separada falhou (${e.message?.slice(0,40)}) — usando default`);
+          lg('warn',`${cat}: layer separada falhou (${e.message?.slice(0,40)}) — usando layer ativa`);
         }
         setPct(pp(.10));
 
         const plain=valid.map(f=>({
           type:'Feature',geometry:f.geometry,
-          properties:{stackOrder:0,layerId}
+          properties:{stackOrder:0,layerId:'default'}
         }));
         const imported=await rpc.invoke('importRawSections',[plain]);
         if(!Array.isArray(imported)||!imported.length)
           throw new Error(`${cat}: importRawSections sem retorno`);
-        lg('ok',`${cat}: ${imported.length} seções na layer "${layerId.slice(0,10)}..."`);
+        lg('ok',`${cat}: ${imported.length} seções importadas`);
         setPct(pp(.50));
 
         const updates=imported.map((imp,i)=>{
