@@ -785,6 +785,11 @@ function App(){
       if(!valid.length){lg('warn',`${cat}: sem triângulos válidos`);return;}
       const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
       lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
+
+      // Avisar se a contagem é alta — Giraffe tem limite de seções por projeto.
+      // Se aparecer "Too many sections", apague seções antigas do projeto antes de fixar.
+      if(valid.length>600)
+        lg('warn',`${cat}: ${valid.length} triângulos pode exceder o limite do Giraffe. Se der erro, reduza o buffer ou use resolução Normal.`);
       setPct(10);
 
       // Features com layerId:'default' (campo obrigatório pelo SDK interno do Giraffe —
@@ -917,20 +922,23 @@ function App(){
 
       // 6. Importar Delaunator e fazer drape de cada polígono
       const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
-      const STEP=2/111320; // ~2m em graus (era 5m — reduzido para mais resolução nas bordas)
+      // STEPs por categoria: Quadra/Calçada precisam de mais detalhe (bordas finas);
+      // Rua é a maior área e pode usar passo maior sem perda visual significativa.
+      const STEP_FINO  = 2/111320; // ~2m — Quadra e Calçada
+      const STEP_RUA   = 5/111320; // ~5m — Rua (área grande, menos triângulos)
 
       const mkFC=feats=>({type:'FeatureCollection',features:feats});
 
       lg('info','Injetando Z e triangulando Quadra...');
-      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator,contourPtsRel):[];
+      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP_FINO,Delaunator,contourPtsRel):[];
       lg('ok',`Quadra: ${qF.length} triângulos`);
 
       lg('info','Injetando Z e triangulando Calçada...');
-      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator,contourPtsRel):[];
+      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP_FINO,Delaunator,contourPtsRel):[];
       lg('ok',`Calçada: ${cF.length} triângulos`);
 
       lg('info','Injetando Z e triangulando Rua (polígono com buracos)...');
-      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator,contourPtsRel);
+      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP_RUA,Delaunator,contourPtsRel);
       lg('ok',`Rua: ${rF.length} triângulos`);
 
       if(!qF.length&&!cF.length&&!rF.length)
