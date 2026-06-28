@@ -894,9 +894,21 @@ function App(){
       //    rua2D     = buffer − quadras − calçadas
       let quadra2D=null,calcada2D=null;
       let rua2D=mae;
+
+      // Ordem de prioridade: Calçada > Quadra > Rua
+      // A calçada do GeoSampa se sobrepõe nativamente à quadra.
+      // Para que as três áreas sejam mutuamente exclusivas:
+      //   quadra2D  = (buffer ∩ quadras) − calçadas   ← subtrai calçada da quadra
+      //   calcada2D =  buffer ∩ calçadas               ← calçada intacta
+      //   rua2D     =  buffer − quadras − calçadas     ← exclusão final
+
       if(qUnion){
         try{
-          quadra2D=turf.intersect(mae,qUnion);
+          const qRaw=turf.intersect(mae,qUnion);
+          // Subtrai a calçada da quadra para eliminar sobreposição
+          quadra2D=cUnion&&qRaw?.geometry
+            ?turf.difference(qRaw,cUnion)||qRaw
+            :qRaw;
           const df=turf.difference(rua2D,qUnion);
           if(df?.geometry) rua2D=df;
         }catch(e){lg('warn',`Quadra 2D: ${e.message.slice(0,60)}`);}
@@ -908,7 +920,7 @@ function App(){
           if(df?.geometry) rua2D=df;
         }catch(e){lg('warn',`Calçada 2D: ${e.message.slice(0,60)}`);}
       }
-      lg('ok',`Polígonos 2D calculados · Rua com ${rua2D?.geometry?.type||'?'}`);
+      lg('ok',`Polígonos 2D (sem sobreposição): Quadra=${quadra2D?.geometry?.type||'∅'} · Calçada=${calcada2D?.geometry?.type||'∅'} · Rua=${rua2D?.geometry?.type||'?'}`);
 
       // 5. Preparar pontos das curvas com Z relativo ao datum
       //    Esses pontos têm a elevação EXATA de cada curva — são a fonte de
