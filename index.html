@@ -326,49 +326,128 @@ const CURVAS_TEMP_ID='kv-curvas-3d';
 const CURVAS_PERM_NAME='Curvas de Nível · GeoSampa';
 
 // ══════════════════════════════════════════════════════════════
-//  Separação por Uso do Solo — estratégia correta:
-//  RECORTE 2D PRIMEIRO → TRIANGULAÇÃO 3D DEPOIS
+//  Separação por Uso do Solo — "Drape" sobre TIN existente
 //
-//  O buildTIN original funciona perfeitamente. Rodamos ele 3 vezes,
-//  uma para cada polígono 2D (Quadra, Calçada, Rua). As curvas de
-//  nível são as mesmas para os 3, então os limites 3D se encaixam
-//  perfeitamente sem frestas.
+//  Fluxo:
+//   1. Baixar Quadras e Calçadas do GeoSampa
+//   2. Criar 3 polígonos 2D limpos: intersect/difference com o buffer
+//   3. Para cada polígono 2D, injetar Z em todos os vértices usando
+//      o TIN já gerado como superfície de referência (getZFromTIN)
+//   4. Triangular os polígonos 3D resultantes com Delaunator
+//      + filtro de centróide para excluir triângulos fora do polígono
+//
+//  Não há clipping 3D, não há re-geração de TIN por sub-área,
+//  não há sobreposição — os 3 polígonos 2D são mutuamente exclusivos.
 // ══════════════════════════════════════════════════════════════
+
 const QUADRA_LAYER  = 'geoportal:quadra_viaria_editada';
 const CALCADA_LAYER = 'geoportal:calcada';
 const SPLIT_IDS    = {Quadra:'kv-split-quadra', Calçada:'kv-split-calcada', Rua:'kv-split-rua'};
 const SPLIT_COLORS = {Quadra:'#c87137', Calçada:'#7a8fa6', Rua:'#3a3a3a'};
 
-// Amostra TODOS os pontos das curvas (sem subsampling).
-// Para polígonos menores (quadra, calçada), a densidade completa
-// é necessária para que o Delaunay tenha pontos suficientes.
-function sampleAllPoints(fcs){
-  const pts=[];
-  for(const fc of fcs){
-    for(const f of(fc?.features||[])){
-      const elev=parseFloat(f.properties?.cd_numero_isovalor);
-      if(isNaN(elev)) continue;
-      const g=f.geometry;
-      const lines=g.type==='LineString'?[g.coordinates]
-        :g.type==='MultiLineString'?g.coordinates:[];
-      for(const ln of lines)
-        for(const coord of ln) pts.push({lng:coord[0],lat:coord[1],elev});
-    }
+// ── Interpolação Z baricêntrica do TIN ────────────────────────
+// Para um vértice (lng,lat) de um polígono urbano 2D, localiza o
+// triângulo do TIN que o contém e retorna sua altura relativa Z.
+// Usa coordenadas em graus para o teste 2D (estável, sem conversão
+// de escala), e pesos baricêntricos para interpolar Z (em metros).
+function getZFromTIN(lng,lat,tinFeatures){
+  for(const tri of tinFeatures){
+    const ring=tri.geometry.coordinates[0];
+    const[ax,ay,az=0]=ring[0],[bx,by,bz=0]=ring[1],[cx,cy,cz=0]=ring[2];
+    const det=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);
+    if(Math.abs(det)<1e-14) continue;
+    const w1=((by-cy)*(lng-cx)+(cx-bx)*(lat-cy))/det;
+    const w2=((cy-ay)*(lng-cx)+(ax-cx)*(lat-cy))/det;
+    const w3=1-w1-w2;
+    if(w1>=-1e-3&&w2>=-1e-3&&w3>=-1e-3)
+      return Math.max(0,w1*az+w2*bz+w3*cz);
   }
-  return pts;
+  return null;
 }
 
-// Une features de polígono em um único polígono 2D.
-function buildUnion2D(features){
-  const polys=features.filter(f=>
-    f?.geometry&&['Polygon','MultiPolygon'].includes(f.geometry.type)
-  );
-  if(!polys.length) return null;
-  let result=polys[0];
-  for(let i=1;i<polys.length;i++){
-    try{result=turf.union(result,polys[i]);}catch(_){}
+// ── Adensamento de anel ───────────────────────────────────────
+// Insere vértices intermediários a cada stepDeg graus.
+// ~5m = 5/111320 ≈ 4.5e-5 graus em SP.
+function densifyRing(ring,stepDeg){
+  if(!ring||ring.length<3) return ring;
+  const out=[];
+  for(let i=0;i<ring.length-1;i++){
+    const p1=ring[i],p2=ring[i+1];
+    out.push(p1);
+    const d=Math.hypot(p2[0]-p1[0],p2[1]-p1[1]);
+    if(d>stepDeg){
+      const n=Math.ceil(d/stepDeg);
+      for(let j=1;j<n;j++){
+        const t=j/n;
+        out.push([p1[0]+t*(p2[0]-p1[0]),p1[1]+t*(p2[1]-p1[1])]);
+      }
+    }
   }
-  return result;
+  out.push(out[0]);
+  return out;
+}
+
+// ── Drape + Triangulação de um polígono 2D ────────────────────
+// 1. Adensa o anel externo (~5m) e injeta Z de cada vértice via TIN
+// 2. Injeta Z nos vértices dos anéis internos (buracos) sem adensá-los
+// 3. Triangula tudo com Delaunator
+// 4. Filtra triângulos cujo centróide esteja fora do polígono
+//    (automaticamente exclui triângulos em buracos e na área convexa
+//    externa para polígonos côncavos)
+// Retorna array de features de triângulo com {avgH,ha,hb,hc,usage}.
+function drapeFeature(feat,tinFeatures,usage,stepDeg,Delaunator){
+  if(!feat?.geometry) return[];
+  const polys=feat.geometry.type==='Polygon'?[feat.geometry.coordinates]
+    :feat.geometry.type==='MultiPolygon'?feat.geometry.coordinates:[];
+  const out=[];
+
+  for(const polyCoords of polys){
+    if(!polyCoords.length||!polyCoords[0]||polyCoords[0].length<4) continue;
+
+    // Coletar pontos: anel externo adensado + anéis internos sem adensamento
+    const SNAP=5e-7;
+    const seenP=new Map();
+    const pts=[];
+    const addPt=(lng,lat)=>{
+      const k=`${lng/SNAP|0},${lat/SNAP|0}`;
+      if(seenP.has(k)) return;
+      seenP.set(k,true);
+      const z=getZFromTIN(lng,lat,tinFeatures);
+      pts.push([lng,lat,z!==null?z:0]);
+    };
+
+    // Anel externo — adensado para drape suave
+    for(const[lng,lat] of densifyRing(polyCoords[0],stepDeg).slice(0,-1))
+      addPt(lng,lat);
+
+    // Anéis internos (buracos) — apenas vértices originais com Z
+    for(let ri=1;ri<polyCoords.length;ri++)
+      for(const[lng,lat] of polyCoords[ri]) addPt(lng,lat);
+
+    if(pts.length<3) continue;
+
+    // Triangulação Delaunay 2D
+    const d=new Delaunator(pts.flatMap(p=>[p[0],p[1]]));
+
+    // Polígono 2D completo (com buracos) para filtro de centróide
+    const poly2D={type:'Feature',geometry:{type:'Polygon',
+      coordinates:polyCoords.map(r=>r.map(p=>[p[0],p[1]]))}};
+
+    for(let i=0;i<d.triangles.length;i+=3){
+      const A=pts[d.triangles[i]],B=pts[d.triangles[i+1]],C=pts[d.triangles[i+2]];
+      const area=(B[0]-A[0])*(C[1]-A[1])-(C[0]-A[0])*(B[1]-A[1]);
+      if(Math.abs(area)<1e-14) continue;
+      const cx=(A[0]+B[0]+C[0])/3,cy=(A[1]+B[1]+C[1])/3;
+      try{if(!turf.booleanPointInPolygon(turf.point([cx,cy]),poly2D)) continue;}
+      catch(_){continue;}
+      const ha=A[2],hb=B[2],hc=C[2];
+      out.push({type:'Feature',
+        properties:{avgH:(ha+hb+hc)/3,ha,hb,hc,usage},
+        geometry:{type:'Polygon',
+          coordinates:[[[A[0],A[1],ha],[B[0],B[1],hb],[C[0],C[1],hc],[A[0],A[1],ha]]]}});
+    }
+  }
+  return out;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -387,7 +466,7 @@ function App(){
   const[pct,setPct]=useState(0);
   const[logs,setLogs]=useState([]);
   const logEl=useRef(null);
-  const[splitFcs,setSplitFcs]=useState(null);   // {Quadra:FC, Calçada:FC, Rua:FC}
+  const[splitFcs,setSplitFcs]=useState(null);
   const[splitVis,setSplitVis]=useState({Quadra:true,Calçada:true,Rua:true});
   const[splitBusy,setSplitBusy]=useState(false);
 
@@ -638,7 +717,7 @@ function App(){
     }
   };
 
-  // ─── Fixar patches (unificado ou por categoria se split foi feito) ──
+  // ─── Fixar patches (multi-categoria se split disponível) ───────
   const doFixar=async()=>{
     if(!tin||phase!=='r_patch'||busy) return;
     setPhase('patch');setPct(0);
@@ -662,14 +741,12 @@ function App(){
         const allH=valid.flatMap(f=>f.geometry.coordinates[0].slice(0,3).map(v=>v[2]||0));
         lg('info',`${cat}: ${valid.length} tri | Z ${Math.min(...allH).toFixed(2)}–${Math.max(...allH).toFixed(2)}m`);
         setPct(pp(.05));
-        const plain=valid.map(f=>({
-          type:'Feature',geometry:f.geometry,
-          properties:{stackOrder:0,layerId:'default',usage:cat}
-        }));
+        const plain=valid.map(f=>({type:'Feature',geometry:f.geometry,
+          properties:{stackOrder:0,layerId:'default',usage:cat}}));
         const imported=await rpc.invoke('importRawSections',[plain]);
         if(!Array.isArray(imported)||!imported.length)
           throw new Error(`${cat}: importRawSections sem retorno`);
-        lg('ok',`${cat}: ${imported.length} seções criadas`);setPct(pp(.50));
+        lg('ok',`${cat}: ${imported.length} seções`);setPct(pp(.50));
         const updates=imported.map((imp,i)=>{
           const orig=valid[i].geometry.coordinates[0];
           const impR=imp.geometry?.coordinates?.[0];
@@ -687,7 +764,6 @@ function App(){
           return{properties:{id:imp.properties?.id,patch,patchType:'slab',usage:cat}};
         });
         const hasId=updates.filter(u=>u.properties.id).length;
-        lg('info',`${cat}: ${hasId}/${updates.length} IDs · patch[0]=[${updates[0]?.properties.patch.join(',')}]`);
         if(hasId<updates.length) lg('warn',`${cat}: ${updates.length-hasId} sem ID`);
         setPct(pp(.70));
         const vu=updates.filter(u=>u.properties.id);
@@ -699,115 +775,100 @@ function App(){
       for(const id of Object.values(SPLIT_IDS)){
         try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
       }
-      setPct(100);
-      lg('ok',`✓ ${total} patches 3D — ${nCats} categoria(s)!`);
+      setPct(100);lg('ok',`✓ ${total} patches — ${nCats} categoria(s)!`);
       setPhase('done');
     }catch(e){lg('err',`Erro: ${e.message}`);setPhase('r_patch');setPct(0);}
   };
 
-  // ─── Separar por Uso do Solo ─────────────────────────────────
-  // Estratégia: RECORTE 2D PRIMEIRO → TRIANGULAÇÃO 3D DEPOIS
-  //
-  // 1. Baixar quadras e calçadas do GeoSampa
-  // 2. Recortar o PoligonoMae em 3 polígonos 2D limpos com turf
-  // 3. Rodar buildTIN separadamente para cada polígono 2D
-  //    (mesmas curvas de nível → Z's consistentes nas bordas)
-  // 4. Publicar 3 camadas temporárias separadas
+  // ─── Drape das camadas urbanas sobre o TIN ──────────────────
+  // Fluxo:
+  //  1. Baixar Quadras + Calçadas → uniões 2D
+  //  2. Calcular 3 polígonos 2D mutuamente exclusivos (intersect/diff)
+  //  3. drapeFeature: injetar Z em cada vértice via getZFromTIN,
+  //     triangular com Delaunator, filtrar por centróide
+  //  4. Publicar 3 camadas temporárias separadas
   const doSplit=async()=>{
-    if(!tin||!fcs||busy||splitBusy) return;
+    if(!tin||busy||splitBusy) return;
     setSplitBusy(true);
-    lg('info','━━ Separando por uso do solo (recorte 2D → 3D por categoria) ━━');
+    lg('info','━━ Drape das camadas urbanas sobre o TIN ━━');
     try{
-      // ── 1. Buscar quadras e calçadas ──────────────────────────
-      lg('info',`Buscando camadas GeoSampa...`);
+      // 1. Fetch
+      lg('info',`Buscando ${QUADRA_LAYER.split(':')[1]} e ${CALCADA_LAYER.split(':')[1]}...`);
       const[qRes,cRes]=await Promise.allSettled([
         fetchWFS(QUADRA_LAYER,...geo.bbox,500,30000),
         fetchWFS(CALCADA_LAYER,...geo.bbox,500,30000),
       ]);
-      const quadraFeats=qRes.status==='fulfilled'?(qRes.value?.features||[]):[];
-      const calcadaFeats=cRes.status==='fulfilled'?(cRes.value?.features||[]):[];
+      const qFeatsRaw=qRes.status==='fulfilled'?(qRes.value?.features||[]):[];
+      const cFeatsRaw=cRes.status==='fulfilled'?(cRes.value?.features||[]):[];
       if(qRes.status==='rejected') lg('warn',`Quadras: ${(qRes.reason?.message||'err').slice(0,60)}`);
       if(cRes.status==='rejected') lg('warn',`Calçadas: ${(cRes.reason?.message||'err').slice(0,60)}`);
-      lg('ok',`Quadras: ${quadraFeats.length} · Calçadas: ${calcadaFeats.length}`);
+      lg('ok',`Quadras: ${qFeatsRaw.length} · Calçadas: ${cFeatsRaw.length}`);
 
-      // ── 2. PoligonoMae = buffer ao redor do terreno selecionado
-      const poligonoMae=turf.buffer(
+      // 2. Polígono mãe = buffer do terreno selecionado
+      const mae=turf.buffer(
         {type:'Feature',geometry:geo.geom,properties:{}},buf,{units:'meters'}
       );
 
-      // ── 3. Uniões das camadas
-      lg('info','Construindo polígonos 2D de cada uso do solo...');
-      const quadraUnion=buildUnion2D(quadraFeats);
-      const calcadaUnion=buildUnion2D(calcadaFeats);
-
-      // ── 4. Recorte 2D: 3 polígonos limpos, sem sobreposição
-      //    poligonoQuadra  = interseção do buffer com as quadras
-      //    poligonoCalcada = interseção do buffer com as calçadas
-      //    poligonoRua     = o que sobrou (diferença)
-      let poligonoQuadra=null,poligonoCalcada=null;
-      let poligonoRua=poligonoMae;
-
-      if(quadraUnion){
-        try{
-          poligonoQuadra=turf.intersect(poligonoMae,quadraUnion);
-          const diff=turf.difference(poligonoRua,quadraUnion);
-          if(diff?.geometry) poligonoRua=diff;
-        }catch(e){lg('warn',`Recorte quadra: ${e.message.slice(0,60)}`);}
-      }
-      if(calcadaUnion){
-        try{
-          poligonoCalcada=turf.intersect(poligonoMae,calcadaUnion);
-          const diff=turf.difference(poligonoRua,calcadaUnion);
-          if(diff?.geometry) poligonoRua=diff;
-        }catch(e){lg('warn',`Recorte calçada: ${e.message.slice(0,60)}`);}
-      }
-
-      // ── 5. Triangulação 3D independente para cada polígono 2D
-      // Usa sampleAllPoints (sem subsampling) para garantir
-      // densidade suficiente em polígonos menores.
-      const datum=stats.datum;
-      const allContourPts=sampleAllPoints(fcs);
-      lg('info',`${allContourPts.length} pontos de curva disponíveis`);
-
-      const result={
-        Quadra:  {type:'FeatureCollection',features:[]},
-        Calçada: {type:'FeatureCollection',features:[]},
-        Rua:     {type:'FeatureCollection',features:[]},
+      // 3. Uniões das camadas
+      const buildUnion=feats=>{
+        const polys=feats.filter(f=>f?.geometry&&
+          ['Polygon','MultiPolygon'].includes(f.geometry.type));
+        if(!polys.length) return null;
+        let r=polys[0];
+        for(let i=1;i<polys.length;i++){try{r=turf.union(r,polys[i]);}catch(_){}}
+        return r;
       };
+      const qUnion=buildUnion(qFeatsRaw);
+      const cUnion=buildUnion(cFeatsRaw);
 
-      for(const[usage,poligono] of[
-        ['Quadra',  poligonoQuadra ],
-        ['Calçada', poligonoCalcada],
-        ['Rua',     poligonoRua    ],
-      ]){
-        if(!poligono?.geometry){
-          lg('warn',`${usage}: polígono 2D vazio — pulando`);
-          continue;
-        }
-        // Clip dos pontos de curva ao polígono desta categoria
-        const pts=allContourPts.filter(p=>{
-          try{return turf.booleanPointInPolygon([p.lng,p.lat],poligono);}
-          catch(_){return false;}
-        });
-        lg('info',`${usage}: ${pts.length} pontos de curva no polígono`);
-        if(pts.length<4){
-          lg('warn',`${usage}: pontos insuficientes (${pts.length}) — pulando`);
-          continue;
-        }
-        // Rodar buildTIN original (sem modificação alguma)
-        const tinFC=await buildTIN(pts,datum);
-        if(!tinFC.features.length){
-          lg('warn',`${usage}: sem triângulos gerados`);
-          continue;
-        }
-        // Injetar usage em cada triângulo gerado
-        result[usage].features=tinFC.features.map(f=>({
-          ...f,properties:{...f.properties,usage}
-        }));
-        lg('ok',`${usage}: ${tinFC.features.length} triângulos`);
+      // 4. Três polígonos 2D mutuamente exclusivos
+      //    quadra2D  = buffer ∩ quadras
+      //    calcada2D = buffer ∩ calçadas
+      //    rua2D     = buffer − quadras − calçadas
+      let quadra2D=null,calcada2D=null;
+      let rua2D=mae;
+      if(qUnion){
+        try{
+          quadra2D=turf.intersect(mae,qUnion);
+          const df=turf.difference(rua2D,qUnion);
+          if(df?.geometry) rua2D=df;
+        }catch(e){lg('warn',`Quadra 2D: ${e.message.slice(0,60)}`);}
       }
+      if(cUnion){
+        try{
+          calcada2D=turf.intersect(mae,cUnion);
+          const df=turf.difference(rua2D,cUnion);
+          if(df?.geometry) rua2D=df;
+        }catch(e){lg('warn',`Calçada 2D: ${e.message.slice(0,60)}`);}
+      }
+      lg('ok',`Polígonos 2D calculados · Rua com ${rua2D?.geometry?.type||'?'}`);
 
-      // ── 6. Publicar 3 camadas temporárias separadas
+      // 5. Importar Delaunator e fazer drape de cada polígono
+      const{default:Delaunator}=await import('https://esm.sh/delaunator@5.0.0');
+      const STEP=5/111320; // ~5m em graus
+
+      const mkFC=feats=>({type:'FeatureCollection',features:feats});
+
+      lg('info','Injetando Z e triangulando Quadra...');
+      const qF=quadra2D?drapeFeature(quadra2D,tin.features,'Quadra',STEP,Delaunator):[];
+      lg('ok',`Quadra: ${qF.length} triângulos`);
+
+      lg('info','Injetando Z e triangulando Calçada...');
+      const cF=calcada2D?drapeFeature(calcada2D,tin.features,'Calçada',STEP,Delaunator):[];
+      lg('ok',`Calçada: ${cF.length} triângulos`);
+
+      lg('info','Injetando Z e triangulando Rua (polígono com buracos)...');
+      const rF=drapeFeature(rua2D,tin.features,'Rua',STEP,Delaunator);
+      lg('ok',`Rua: ${rF.length} triângulos`);
+
+      if(!qF.length&&!cF.length&&!rF.length)
+        throw new Error('Nenhum triângulo gerado — verifique as camadas');
+
+      const result={Quadra:mkFC(qF),Calçada:mkFC(cF),Rua:mkFC(rF)};
+      const counts=Object.entries(result).map(([k,v])=>`${v.features.length} ${k}`).join(' · ');
+      lg('ok',`Total: ${counts}`);
+
+      // 6. Publicar 3 camadas temporárias
       try{await rpc.invoke('removeTempLayer',[PREVIEW_ID]);}catch(_){}
       for(const[cat,fc] of Object.entries(result)){
         const id=SPLIT_IDS[cat];
@@ -825,10 +886,9 @@ function App(){
       }
       setSplitFcs(result);
       setSplitVis({Quadra:true,Calçada:true,Rua:true});
-      const counts=Object.entries(result).map(([k,v])=>`${v.features.length} ${k}`).join(' · ');
-      lg('ok',`✓ Terreno dividido: ${counts}. Use ✂ nos botões para ocultar/mostrar.`);
+      lg('ok','✓ 3 camadas publicadas. Clique nos botões para ocultar/mostrar cada uso.');
     }catch(e){
-      lg('err',`Separação: ${e.message}`);
+      lg('err',`Drape: ${e.message}`);
     }finally{
       setSplitBusy(false);
     }
@@ -839,9 +899,8 @@ function App(){
     const nv={...splitVis,[cat]:!splitVis[cat]};
     setSplitVis(nv);
     const id=SPLIT_IDS[cat];
-    if(!nv[cat]){
-      try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
-    }else{
+    if(!nv[cat]){try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}}
+    else{
       const fc=splitFcs[cat];
       if(fc?.features?.length){
         try{await rpc.invoke('removeTempLayer',[id]);}catch(_){}
@@ -984,7 +1043,7 @@ function App(){
         h('span',{className:'rk'},'Pts controle'),  h('span',{className:'rv'},stats.npts.toLocaleString('pt-BR')),
       ),
 
-      // ── Uso do Solo 3D ──────────────────────────────────────────
+      // Uso do Solo 3D
       hasTin&&h('div',{style:{flexShrink:0}},
         h('div',{className:'divl'}),
         h('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'5px'}},
